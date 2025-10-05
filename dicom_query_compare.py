@@ -359,6 +359,39 @@ def get_date_range() -> tuple:
     return yesterday_str, today_str
 
 
+def is_within_last_12_hours(study_date: str, study_time: str) -> bool:
+    """
+    Check if a study is within the last 12 hours.
+
+    Args:
+        study_date: Study date in YYYYMMDD format
+        study_time: Study time in HHMMSS format
+
+    Returns:
+        True if study is within last 12 hours, False otherwise
+    """
+    if not study_date or len(study_date) < 8:
+        return False
+
+    # Parse study time (handle various formats)
+    study_time_clean = study_time.replace('.', '').replace(':', '')
+    if len(study_time_clean) < 6:
+        study_time_clean = study_time_clean.ljust(6, '0')
+
+    try:
+        # Create datetime from study date and time
+        study_datetime_str = f"{study_date}{study_time_clean[:6]}"
+        study_datetime = datetime.strptime(study_datetime_str, "%Y%m%d%H%M%S")
+
+        # Calculate 12 hours ago
+        twelve_hours_ago = datetime.now() - timedelta(hours=12)
+
+        return study_datetime >= twelve_hours_ago
+    except (ValueError, TypeError):
+        # If parsing fails, exclude the study
+        return False
+
+
 def compare_studies(remote_studies: List[DicomStudy], local_studies: List[DicomStudy]) -> List[DicomStudy]:
     """
     Compare remote and local studies, return studies missing on local.
@@ -498,18 +531,27 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient):
     # Get date range (yesterday and today)
     date_from, date_to = get_date_range()
     print(f"Searching for studies from {date_from} to {date_to}")
+    print(f"Filtering studies within last 12 hours")
 
     # Query remote server
     print("\n" + "=" * 80)
     print("Querying Remote Server")
     print("=" * 80)
-    remote_studies = client.query_studies(config.remote_node, date_from, date_to)
+    remote_studies_all = client.query_studies(config.remote_node, date_from, date_to)
+
+    # Filter remote studies to last 12 hours
+    remote_studies = [s for s in remote_studies_all if is_within_last_12_hours(s.study_date, s.study_time)]
+    print(f"Filtered to {len(remote_studies)} studies within last 12 hours (from {len(remote_studies_all)} total)")
 
     # Query local server
     print("\n" + "=" * 80)
     print("Querying Local Server")
     print("=" * 80)
-    local_studies = client.query_studies(config.local_node, date_from, date_to)
+    local_studies_all = client.query_studies(config.local_node, date_from, date_to)
+
+    # Filter local studies to last 12 hours
+    local_studies = [s for s in local_studies_all if is_within_last_12_hours(s.study_date, s.study_time)]
+    print(f"Filtered to {len(local_studies)} studies within last 12 hours (from {len(local_studies_all)} total)")
 
     # Compare studies
     missing_studies = compare_studies(remote_studies, local_studies)
