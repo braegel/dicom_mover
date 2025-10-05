@@ -376,16 +376,15 @@ def compare_studies(remote_studies: List[DicomStudy], local_studies: List[DicomS
     return missing_studies
 
 
-def filter_small_series(studies: List[DicomStudy], client: DicomQueryClient,
-                        remote_node: DicomNode, max_images: int = 10) -> List[tuple]:
+def filter_smallest_series(studies: List[DicomStudy], client: DicomQueryClient,
+                           remote_node: DicomNode) -> List[tuple]:
     """
-    Query series for each study and filter those with <= max_images.
+    Query series for each study and select the one with the smallest number of images.
 
     Args:
         studies: List of studies to check
         client: DICOM query client
         remote_node: Remote node to query
-        max_images: Maximum number of images per series (inclusive)
 
     Returns:
         List of tuples (study, series) for series to transfer
@@ -400,9 +399,11 @@ def filter_small_series(studies: List[DicomStudy], client: DicomQueryClient,
         series_list = client.query_series(remote_node, study.study_uid)
         study.series = series_list
 
-        for series in series_list:
-            if 0 < series.num_images <= max_images:
-                transfer_list.append((study, series))
+        # Find the series with the smallest number of images
+        if series_list:
+            smallest_series = min(series_list, key=lambda s: s.num_images)
+            if smallest_series.num_images > 0:
+                transfer_list.append((study, smallest_series))
 
     return transfer_list
 
@@ -419,7 +420,7 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         local_ae_title: Local AE title (destination)
     """
     if not transfer_list:
-        print("\nNo series to transfer (all series have > 10 images)")
+        print("\nNo series to transfer")
         return
 
     total_series = len(transfer_list)
@@ -524,17 +525,17 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient):
     if missing_studies:
         print_study_table(missing_studies, "Studies Missing on Local Server")
 
-        # Filter for small series
-        transfer_list = filter_small_series(missing_studies, client, config.remote_node, max_images=10)
+        # Get smallest series from each study
+        transfer_list = filter_smallest_series(missing_studies, client, config.remote_node)
 
         if transfer_list:
-            print(f"\nFound {len(transfer_list)} series with ≤10 images to transfer")
+            print(f"\nFound {len(transfer_list)} series to transfer (smallest from each study)")
 
             # Start sequential transfer automatically
             transfer_series_sequential(transfer_list, client, config.remote_node,
                                       config.local_node.ae_title)
         else:
-            print("\nNo series with ≤10 images found.")
+            print("\nNo series found to transfer.")
     else:
         print("\nAll remote studies are present on the local server!")
 
