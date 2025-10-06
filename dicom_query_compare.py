@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -26,6 +27,9 @@ from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
     StudyRootQueryRetrieveInformationModelMove
 )
+
+# Suppress pydicom validation warnings for malformed UIDs from remote PACS
+warnings.filterwarnings('ignore', category=UserWarning, module='pydicom.valuerep')
 
 
 CONFIG_FILE = "dicom_config.json"
@@ -349,6 +353,7 @@ class DicomQueryClient:
             return False
 
 
+
 def get_date_range() -> tuple:
     """Get today and yesterday in YYYYMMDD format"""
     today = datetime.now()
@@ -360,16 +365,17 @@ def get_date_range() -> tuple:
     return yesterday_str, today_str
 
 
-def is_within_last_12_hours(study_date: str, study_time: str) -> bool:
+def is_within_last_hours(study_date: str, study_time: str, hours: int = 3) -> bool:
     """
-    Check if a study is within the last 12 hours.
+    Check if a study is within the last N hours.
 
     Args:
         study_date: Study date in YYYYMMDD format
         study_time: Study time in HHMMSS format
+        hours: Number of hours to look back (default: 3)
 
     Returns:
-        True if study is within last 12 hours, False otherwise
+        True if study is within last N hours, False otherwise
     """
     if not study_date or len(study_date) < 8:
         return False
@@ -384,10 +390,10 @@ def is_within_last_12_hours(study_date: str, study_time: str) -> bool:
         study_datetime_str = f"{study_date}{study_time_clean[:6]}"
         study_datetime = datetime.strptime(study_datetime_str, "%Y%m%d%H%M%S")
 
-        # Calculate 12 hours ago
-        twelve_hours_ago = datetime.now() - timedelta(hours=12)
+        # Calculate N hours ago
+        hours_ago = datetime.now() - timedelta(hours=hours)
 
-        return study_datetime >= twelve_hours_ago
+        return study_datetime >= hours_ago
     except (ValueError, TypeError):
         # If parsing fails, exclude the study
         return False
@@ -410,50 +416,85 @@ def compare_studies(remote_studies: List[DicomStudy], local_studies: List[DicomS
     return missing_studies
 
 
-def filter_smallest_series(studies: List[DicomStudy], client: DicomQueryClient,
-                           remote_node: DicomNode, min_images: Optional[int] = None,
-                           all_series: bool = False) -> List[tuple]:
+def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClient,
+                              remote_node: DicomNode, local_node: DicomNode,
+                              min_images: Optional[int] = None,
+                              all_series: bool = False) -> List[tuple]:
     """
-    Query series for each study and filter based on selection criteria.
+    Query series for each study on both remote and local, then filter incomplete series.
+
+    A series is considered incomplete if:
+    - It doesn't exist on local, OR
+    - It exists but has fewer images than on remote
 
     Args:
         studies: List of studies to check
         client: DICOM query client
         remote_node: Remote node to query
+        local_node: Local node to query
         min_images: If set, transfer all series with fewer than this many images
         all_series: If True, transfer all series
 
     Returns:
-        List of tuples (study, series) for series to transfer
+        List of tuples (study, remote_series, local_image_count) for series to transfer
     """
     transfer_list = []
 
     print(f"\nAnalyzing series in {len(studies)} studies...")
 
     for i, study in enumerate(studies, 1):
-        print(f"  [{i}/{len(studies)}] Querying series for {study.patient_name}...")
+        print(f"  [{i}/{len(studies)}] Checking series for {study.patient_name}...")
 
-        series_list = client.query_series(remote_node, study.study_uid)
-        study.series = series_list
+        # Query series on remote
+        remote_series_list = client.query_series(remote_node, study.study_uid)
+        study.series = remote_series_list
 
-        if not series_list:
+        if not remote_series_list:
             continue
 
-        if all_series:
-            # Transfer all series
-            for series in series_list:
-                if series.num_images > 0:
-                    transfer_list.append((study, series))
-        elif min_images is not None:
-            # Transfer series with fewer than min_images
-            for series in series_list:
-                if 0 < series.num_images < min_images:
-                    transfer_list.append((study, series))
-        else:
-            # Default: transfer only the smallest series
-            smallest_series = min(series_list, key=lambda s: s.num_images)
-            if smallest_series.num_images > 0:
-                transfer_list.append((study, smallest_series))
+        # Query series on local
+        local_series_list = client.query_series(local_node, study.study_uid)
+        local_series_dict = {series.series_uid: series.num_images for series in local_series_list}
+
+        # Find incomplete series
+        for series in remote_series_list:
+            local_image_count = local_series_dict.get(series.series_uid, 0)
+
+            # Skip if series is complete
+            if local_image_count >= series.num_images:
+                continue
+
+            # Skip if series has no images
+            if series.num_images <= 0:
+                continue
+
+            # Apply filtering based on selection criteria
+            should_transfer = False
+
+            if all_series:
+                should_transfer = True
+            elif min_images is not None:
+                should_transfer = series.num_images < min_images
+            else:
+                # Default: will select smallest later
+                should_transfer = True
+
+            if should_transfer:
+                transfer_list.append((study, series, local_image_count))
+
+    # If default mode (not all_series, not min_images), keep only smallest per study
+    if not all_series and min_images is None and transfer_list:
+        # Group by study and keep only smallest series per study
+        study_series_map = {}
+        for study, series, local_count in transfer_list:
+            if study.study_uid not in study_series_map:
+                study_series_map[study.study_uid] = (study, series, local_count)
+            else:
+                _, existing_series, existing_local_count = study_series_map[study.study_uid]
+                if series.num_images < existing_series.num_images:
+                    study_series_map[study.study_uid] = (study, series, local_count)
+
+        transfer_list = list(study_series_map.values())
 
     return transfer_list
 
@@ -461,10 +502,10 @@ def filter_smallest_series(studies: List[DicomStudy], client: DicomQueryClient,
 def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryClient,
                                remote_node: DicomNode, local_ae_title: str):
     """
-    Transfer series sequentially (one at a time) with minimal status output.
+    Transfer series sequentially (one at a time) with detailed status output.
 
     Args:
-        transfer_list: List of (study, series) tuples to transfer
+        transfer_list: List of (study, series, local_image_count) tuples to transfer
         client: DICOM query client
         remote_node: Remote node (source)
         local_ae_title: Local AE title (destination)
@@ -474,7 +515,7 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         return
 
     total_series = len(transfer_list)
-    total_images = sum(series.num_images for _, series in transfer_list)
+    total_images = sum(series.num_images for _, series, _ in transfer_list)
 
     transferred_series = 0
     transferred_images = 0
@@ -482,34 +523,47 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
 
     start_time = time.time()
 
-    print(f"\nStarting transfer: {total_series} series, {total_images} images\n")
+    print(f"\nStarting transfer: {total_series} series, {total_images} images")
+    print(f"{'=' * 120}\n")
 
-    for i, (study, series) in enumerate(transfer_list, 1):
+    for i, (study, series, local_count) in enumerate(transfer_list, 1):
         # Format study information
         date_formatted = f"{study.study_date[:4]}-{study.study_date[4:6]}-{study.study_date[6:8]}" if len(study.study_date) == 8 else study.study_date
+        timestamp = datetime.now().strftime("%H:%M:%S")
 
-        # Single line output with carriage return for updating
-        status_line = f"[{i}/{total_series}] {study.patient_name} | {date_formatted} | Series {series.series_number} ({series.num_images} img)"
-        print(f"\r{status_line:<100}", end='', flush=True)
+        # Show completeness status
+        if local_count == 0:
+            status_info = f"New series ({series.num_images} img)"
+        else:
+            status_info = f"Incomplete ({local_count}/{series.num_images} img)"
 
-        # Perform the transfer
+        # Print C-MOVE info with timestamp
+        print(f"[{timestamp}] [{i}/{total_series}] C-MOVE START")
+        print(f"  Patient: {study.patient_name}")
+        print(f"  Date: {date_formatted}")
+        print(f"  Series: {series.series_number} ({series.modality}) - {status_info}")
+        print(f"  Description: {series.series_description[:60]}")
+
+        # Perform the transfer (only one C-MOVE at a time)
         success = client.move_series(remote_node, local_ae_title, study.study_uid, series.series_uid)
+
+        end_timestamp = datetime.now().strftime("%H:%M:%S")
 
         if success:
             transferred_series += 1
             transferred_images += series.num_images
+            print(f"[{end_timestamp}] C-MOVE COMPLETE ✓")
         else:
             failed_series += 1
-            # Print failed transfers on a new line
-            print(f"\r{status_line} - FAILED{' ' * 20}")
+            print(f"[{end_timestamp}] C-MOVE FAILED ✗")
 
-    # Clear the line and print final summary
-    print(f"\r{' ' * 100}\r", end='')
+        print()  # Empty line between transfers
 
     total_time = time.time() - start_time
     final_rate = (transferred_images / total_time * 60) if total_time > 0 else 0
 
-    print(f"\nTransfer statistics:")
+    print(f"{'=' * 120}")
+    print(f"Transfer statistics:")
     print(f"  Successfully transferred: {transferred_series}/{total_series} series ({transferred_images} images)")
     if failed_series > 0:
         print(f"  Failed: {failed_series} series")
@@ -539,7 +593,7 @@ def print_study_table(studies: List[DicomStudy], title: str):
 
 
 def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Optional[int] = None,
-                   all_series: bool = False):
+                   all_series: bool = False, hours: int = 3):
     """Run a single synchronization cycle"""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 100}")
@@ -549,7 +603,7 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Op
     # Get date range (yesterday and today)
     date_from, date_to = get_date_range()
     print(f"Searching for studies from {date_from} to {date_to}")
-    print(f"Filtering studies within last 12 hours")
+    print(f"Filtering studies within last {hours} hours")
 
     # Query remote server
     print("\n" + "=" * 80)
@@ -557,53 +611,43 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Op
     print("=" * 80)
     remote_studies_all = client.query_studies(config.remote_node, date_from, date_to)
 
-    # Filter remote studies to last 12 hours
-    remote_studies = [s for s in remote_studies_all if is_within_last_12_hours(s.study_date, s.study_time)]
-    print(f"Filtered to {len(remote_studies)} studies within last 12 hours (from {len(remote_studies_all)} total)")
+    # Filter remote studies to last N hours
+    remote_studies = [s for s in remote_studies_all if is_within_last_hours(s.study_date, s.study_time, hours)]
+    print(f"Filtered to {len(remote_studies)} studies within last {hours} hours (from {len(remote_studies_all)} total)")
 
-    # Query local server
-    print("\n" + "=" * 80)
-    print("Querying Local Server")
-    print("=" * 80)
-    local_studies_all = client.query_studies(config.local_node, date_from, date_to)
+    if not remote_studies:
+        print(f"\nNo remote studies found within last {hours} hours")
+        cycle_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n{'=' * 100}")
+        print(f"Sync cycle completed at {cycle_end_time}")
+        print(f"{'=' * 100}")
+        return
 
-    # Filter local studies to last 12 hours
-    local_studies = [s for s in local_studies_all if is_within_last_12_hours(s.study_date, s.study_time)]
-    print(f"Filtered to {len(local_studies)} studies within last 12 hours (from {len(local_studies_all)} total)")
-
-    # Compare studies
-    missing_studies = compare_studies(remote_studies, local_studies)
+    # Compare series between remote and local for all remote studies
+    # This will check which series are missing on local, regardless of whether the study exists locally
+    transfer_list = compare_series_and_filter(remote_studies, client, config.remote_node,
+                                             config.local_node, min_images=min_images,
+                                             all_series=all_series)
 
     # Print results
     print("\n" + "=" * 80)
     print("RESULTS SUMMARY")
     print("=" * 80)
     print(f"Remote studies found: {len(remote_studies)}")
-    print(f"Local studies found:  {len(local_studies)}")
-    print(f"Missing on local:     {len(missing_studies)}")
 
-    if missing_studies:
-        print_study_table(missing_studies, "Studies Missing on Local Server")
-
-        # Get series based on selection criteria
-        transfer_list = filter_smallest_series(missing_studies, client, config.remote_node,
-                                              min_images=min_images, all_series=all_series)
-
-        if transfer_list:
-            if all_series:
-                print(f"\nFound {len(transfer_list)} series to transfer (all series)")
-            elif min_images is not None:
-                print(f"\nFound {len(transfer_list)} series to transfer (with < {min_images} images)")
-            else:
-                print(f"\nFound {len(transfer_list)} series to transfer (smallest from each study)")
-
-            # Start sequential transfer automatically
-            transfer_series_sequential(transfer_list, client, config.remote_node,
-                                      config.local_node.ae_title)
+    if transfer_list:
+        if all_series:
+            print(f"\nFound {len(transfer_list)} series to transfer (all missing series)")
+        elif min_images is not None:
+            print(f"\nFound {len(transfer_list)} series to transfer (missing series with < {min_images} images)")
         else:
-            print("\nNo series found to transfer.")
+            print(f"\nFound {len(transfer_list)} series to transfer (smallest missing series from each study)")
+
+        # Start sequential transfer automatically
+        transfer_series_sequential(transfer_list, client, config.remote_node,
+                                  config.local_node.ae_title)
     else:
-        print("\nAll remote studies are present on the local server!")
+        print("\nNo series found to transfer. All relevant series are present on local server!")
 
     cycle_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 100}")
@@ -619,10 +663,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  %(prog)s                           # Transfer only smallest series (default)
+  %(prog)s                           # Transfer only smallest series (default, last 3 hours)
+  %(prog)s --hours 6                # Transfer from last 6 hours
   %(prog)s --min-images 300         # Transfer all series with < 300 images
   %(prog)s --all-series              # Transfer all series
         '''
+    )
+
+    parser.add_argument(
+        '--hours',
+        type=int,
+        default=3,
+        metavar='N',
+        help='Number of hours to look back for studies (default: 3)'
     )
 
     group = parser.add_mutually_exclusive_group()
@@ -644,13 +697,14 @@ Examples:
     print("DICOM Automatic Synchronization Tool")
     print("=" * 80)
 
-    # Display transfer mode
+    # Display transfer mode and time window
+    print(f"\nTime window: Last {args.hours} hours")
     if args.all_series:
-        print("\nTransfer mode: ALL SERIES")
+        print("Transfer mode: ALL SERIES")
     elif args.min_images is not None:
-        print(f"\nTransfer mode: Series with < {args.min_images} images")
+        print(f"Transfer mode: Series with < {args.min_images} images")
     else:
-        print("\nTransfer mode: Smallest series only (default)")
+        print("Transfer mode: Smallest series only (default)")
 
     # Load or create configuration
     config = DicomConfig()
@@ -684,7 +738,7 @@ Examples:
             print(f"{'#' * 100}")
             print(f"{'#' * 100}")
 
-            run_sync_cycle(config, client, min_images=args.min_images, all_series=args.all_series)
+            run_sync_cycle(config, client, min_images=args.min_images, all_series=args.all_series, hours=args.hours)
 
             # Wait 60 seconds before next cycle
             print(f"\nWaiting 60 seconds before next sync cycle...")
