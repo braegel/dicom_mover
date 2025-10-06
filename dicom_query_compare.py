@@ -468,6 +468,11 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
             if series.num_images <= 0:
                 continue
 
+            # Skip if series has more than 1 image and only 1 image is missing
+            missing_images = series.num_images - local_image_count
+            if series.num_images > 1 and missing_images == 1:
+                continue
+
             # Apply filtering based on selection criteria
             should_transfer = False
 
