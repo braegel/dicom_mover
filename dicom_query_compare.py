@@ -10,6 +10,7 @@ Author: DICOM Expert
 License: MIT
 """
 
+import argparse
 import json
 import os
 import sys
@@ -410,14 +411,17 @@ def compare_studies(remote_studies: List[DicomStudy], local_studies: List[DicomS
 
 
 def filter_smallest_series(studies: List[DicomStudy], client: DicomQueryClient,
-                           remote_node: DicomNode) -> List[tuple]:
+                           remote_node: DicomNode, min_images: Optional[int] = None,
+                           all_series: bool = False) -> List[tuple]:
     """
-    Query series for each study and select the one with the smallest number of images.
+    Query series for each study and filter based on selection criteria.
 
     Args:
         studies: List of studies to check
         client: DICOM query client
         remote_node: Remote node to query
+        min_images: If set, transfer all series with fewer than this many images
+        all_series: If True, transfer all series
 
     Returns:
         List of tuples (study, series) for series to transfer
@@ -432,8 +436,21 @@ def filter_smallest_series(studies: List[DicomStudy], client: DicomQueryClient,
         series_list = client.query_series(remote_node, study.study_uid)
         study.series = series_list
 
-        # Find the series with the smallest number of images
-        if series_list:
+        if not series_list:
+            continue
+
+        if all_series:
+            # Transfer all series
+            for series in series_list:
+                if series.num_images > 0:
+                    transfer_list.append((study, series))
+        elif min_images is not None:
+            # Transfer series with fewer than min_images
+            for series in series_list:
+                if 0 < series.num_images < min_images:
+                    transfer_list.append((study, series))
+        else:
+            # Default: transfer only the smallest series
             smallest_series = min(series_list, key=lambda s: s.num_images)
             if smallest_series.num_images > 0:
                 transfer_list.append((study, smallest_series))
@@ -521,7 +538,8 @@ def print_study_table(studies: List[DicomStudy], title: str):
         print(f"{date_formatted:<12} {time_formatted:<10} {patient_name:<25} {desc:<35} {study.num_images:<8}")
 
 
-def run_sync_cycle(config: DicomConfig, client: DicomQueryClient):
+def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Optional[int] = None,
+                   all_series: bool = False):
     """Run a single synchronization cycle"""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 100}")
@@ -567,11 +585,17 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient):
     if missing_studies:
         print_study_table(missing_studies, "Studies Missing on Local Server")
 
-        # Get smallest series from each study
-        transfer_list = filter_smallest_series(missing_studies, client, config.remote_node)
+        # Get series based on selection criteria
+        transfer_list = filter_smallest_series(missing_studies, client, config.remote_node,
+                                              min_images=min_images, all_series=all_series)
 
         if transfer_list:
-            print(f"\nFound {len(transfer_list)} series to transfer (smallest from each study)")
+            if all_series:
+                print(f"\nFound {len(transfer_list)} series to transfer (all series)")
+            elif min_images is not None:
+                print(f"\nFound {len(transfer_list)} series to transfer (with < {min_images} images)")
+            else:
+                print(f"\nFound {len(transfer_list)} series to transfer (smallest from each study)")
 
             # Start sequential transfer automatically
             transfer_series_sequential(transfer_list, client, config.remote_node,
@@ -589,9 +613,44 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient):
 
 def main():
     """Main function - runs continuous synchronization every minute"""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='DICOM Automatic Synchronization Tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  %(prog)s                           # Transfer only smallest series (default)
+  %(prog)s --min-images 300         # Transfer all series with < 300 images
+  %(prog)s --all-series              # Transfer all series
+        '''
+    )
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--min-images',
+        type=int,
+        metavar='N',
+        help='Transfer all series with fewer than N images'
+    )
+    group.add_argument(
+        '--all-series',
+        action='store_true',
+        help='Transfer all series (no image count limit)'
+    )
+
+    args = parser.parse_args()
+
     print("=" * 80)
     print("DICOM Automatic Synchronization Tool")
     print("=" * 80)
+
+    # Display transfer mode
+    if args.all_series:
+        print("\nTransfer mode: ALL SERIES")
+    elif args.min_images is not None:
+        print(f"\nTransfer mode: Series with < {args.min_images} images")
+    else:
+        print("\nTransfer mode: Smallest series only (default)")
 
     # Load or create configuration
     config = DicomConfig()
@@ -625,7 +684,7 @@ def main():
             print(f"{'#' * 100}")
             print(f"{'#' * 100}")
 
-            run_sync_cycle(config, client)
+            run_sync_cycle(config, client, min_images=args.min_images, all_series=args.all_series)
 
             # Wait 60 seconds before next cycle
             print(f"\nWaiting 60 seconds before next sync cycle...")
