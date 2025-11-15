@@ -13,6 +13,7 @@ License: MIT
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import warnings
@@ -33,6 +34,24 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pydicom.valuerep
 
 
 CONFIG_FILE = "dicom_config.json"
+
+
+def detect_local_ip() -> Optional[str]:
+    """
+    Detect the local IP address automatically.
+    Returns the most likely local network IP.
+    """
+    try:
+        # Create a socket to determine which interface would be used
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.1)
+        # Connect to a public DNS server (doesn't actually send data)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip if not local_ip.startswith('127.') else None
+    except Exception:
+        return None
 
 
 class DicomNode:
@@ -73,8 +92,13 @@ class DicomConfig:
         self.local_node: Optional[DicomNode] = None
         self.remote_node: Optional[DicomNode] = None
 
-    def load(self) -> bool:
-        """Load configuration from file. Returns True if successful."""
+    def load(self, auto_detect_local_ip: bool = True) -> bool:
+        """
+        Load configuration from file. Returns True if successful.
+
+        Args:
+            auto_detect_local_ip: If True, automatically detect and update local IP address
+        """
         if not os.path.exists(self.config_file):
             return False
 
@@ -84,6 +108,17 @@ class DicomConfig:
 
             self.local_node = DicomNode.from_dict(data["local"])
             self.remote_node = DicomNode.from_dict(data["remote"])
+
+            # Auto-detect local IP if enabled
+            if auto_detect_local_ip:
+                detected_ip = detect_local_ip()
+                if detected_ip and detected_ip != self.local_node.ip_address:
+                    print(f"📍 Local IP changed: {self.local_node.ip_address} → {detected_ip}")
+                    self.local_node.ip_address = detected_ip
+                    # Save updated config
+                    self.save()
+                    print(f"   Configuration automatically updated")
+
             return True
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Error loading config: {e}")
@@ -441,20 +476,30 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
     transfer_list = []
 
     print(f"\nAnalyzing series in {len(studies)} studies...")
+    if min_images is not None:
+        print(f"  Mode: Transfer series with < {min_images} images")
+    elif all_series:
+        print(f"  Mode: Transfer ALL incomplete series")
+    else:
+        print(f"  Mode: Transfer smallest series per study (default)")
 
     for i, study in enumerate(studies, 1):
-        print(f"  [{i}/{len(studies)}] Checking series for {study.patient_name}...")
+        print(f"  [{i}/{len(studies)}] Checking series for {study.patient_name} ({study.study_date})...")
 
         # Query series on remote
+        print(f"      Querying remote server...")
         remote_series_list = client.query_series(remote_node, study.study_uid)
         study.series = remote_series_list
+        print(f"      Found {len(remote_series_list)} series on remote")
 
         if not remote_series_list:
             continue
 
         # Query series on local
+        print(f"      Querying local server...")
         local_series_list = client.query_series(local_node, study.study_uid)
         local_series_dict = {series.series_uid: series.num_images for series in local_series_list}
+        print(f"      Found {len(local_series_list)} series on local")
 
         # Find incomplete series
         for series in remote_series_list:
@@ -462,27 +507,42 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
 
             # Skip if series is complete
             if local_image_count >= series.num_images:
+                print(f"      Series {series.series_number}: {series.num_images} images - COMPLETE (skip)")
                 continue
 
             # Skip if series has no images
             if series.num_images <= 0:
-                continue
-
-            # Skip if series has more than 1 image and only 1 image is missing
-            missing_images = series.num_images - local_image_count
-            if series.num_images > 1 and missing_images == 1:
+                print(f"      Series {series.series_number}: 0 images - EMPTY (skip)")
                 continue
 
             # Apply filtering based on selection criteria
             should_transfer = False
+            reason = ""
 
             if all_series:
+                # Transfer all incomplete series
                 should_transfer = True
+                reason = "all-series mode"
             elif min_images is not None:
+                # Transfer series with fewer than N images
                 should_transfer = series.num_images < min_images
+                if should_transfer:
+                    reason = f"has {series.num_images} < {min_images} images"
+                else:
+                    reason = f"has {series.num_images} >= {min_images} images"
             else:
-                # Default: will select smallest later
-                should_transfer = True
+                # Default mode: Skip if series has more than 1 image and only 1 image is missing
+                missing_images = series.num_images - local_image_count
+                if series.num_images > 1 and missing_images == 1:
+                    should_transfer = False
+                    reason = "only 1 image missing"
+                else:
+                    # Will select smallest later
+                    should_transfer = True
+                    reason = "candidate for smallest"
+
+            status = "→ TRANSFER" if should_transfer else "SKIP"
+            print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - {status} ({reason})")
 
             if should_transfer:
                 transfer_list.append((study, series, local_image_count))
@@ -696,6 +756,12 @@ Examples:
         help='Transfer all series (no image count limit)'
     )
 
+    parser.add_argument(
+        '--no-auto-ip',
+        action='store_true',
+        help='Disable automatic local IP detection'
+    )
+
     args = parser.parse_args()
 
     print("=" * 80)
@@ -714,7 +780,7 @@ Examples:
     # Load or create configuration
     config = DicomConfig()
 
-    if not config.load():
+    if not config.load(auto_detect_local_ip=not args.no_auto_ip):
         print("\nNo configuration file found.")
         print("Please run the configuration setup first.")
         config.interactive_setup()
