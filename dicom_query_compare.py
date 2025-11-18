@@ -520,9 +520,14 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
             reason = ""
 
             if all_series:
-                # Transfer all incomplete series
-                should_transfer = True
-                reason = "all-series mode"
+                # Transfer all incomplete series, but skip if only 1 image missing
+                missing_images = series.num_images - local_image_count
+                if missing_images < 2:
+                    should_transfer = False
+                    reason = f"only {missing_images} image(s) missing (need at least 2)"
+                else:
+                    should_transfer = True
+                    reason = f"all-series mode ({missing_images} images missing)"
             elif min_images is not None:
                 # Transfer series with fewer than N images
                 should_transfer = series.num_images < min_images
@@ -531,15 +536,15 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
                 else:
                     reason = f"has {series.num_images} >= {min_images} images"
             else:
-                # Default mode: Skip if series has more than 1 image and only 1 image is missing
+                # Default mode: Only transfer if at least 2 images are missing
                 missing_images = series.num_images - local_image_count
-                if series.num_images > 1 and missing_images == 1:
+                if missing_images < 2:
                     should_transfer = False
-                    reason = "only 1 image missing"
+                    reason = f"only {missing_images} image(s) missing (need at least 2)"
                 else:
                     # Will select smallest later
                     should_transfer = True
-                    reason = "candidate for smallest"
+                    reason = f"candidate for smallest ({missing_images} images missing)"
 
             status = "→ TRANSFER" if should_transfer else "SKIP"
             print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - {status} ({reason})")
