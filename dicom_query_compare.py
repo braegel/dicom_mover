@@ -22,7 +22,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from pydicom.dataset import Dataset
-from pydicom.uid import JPEG2000Lossless
+from pydicom.uid import (
+    JPEG2000Lossless,
+    ExplicitVRLittleEndian,
+    ImplicitVRLittleEndian
+)
 from pynetdicom import AE, debug_logger, evt
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
@@ -34,6 +38,18 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pydicom.valuerep
 
 
 CONFIG_FILE = "dicom_config.json"
+
+# Transfer syntax mapping
+TRANSFER_SYNTAX_MAP = {
+    "JPEG2000Lossless": JPEG2000Lossless,
+    "ExplicitVRLittleEndian": ExplicitVRLittleEndian,
+    "ImplicitVRLittleEndian": ImplicitVRLittleEndian,
+}
+
+
+def get_transfer_syntax_uid(syntax_name: str):
+    """Get the UID object for a transfer syntax name"""
+    return TRANSFER_SYNTAX_MAP.get(syntax_name, JPEG2000Lossless)
 
 
 def detect_local_ip() -> Optional[str]:
@@ -57,22 +73,29 @@ def detect_local_ip() -> Optional[str]:
 class DicomNode:
     """Represents a DICOM node configuration"""
 
-    def __init__(self, name: str, ae_title: str, ip_address: str, port: int):
+    def __init__(self, name: str, ae_title: str, ip_address: str, port: int,
+                 transfer_syntax: str = "JPEG2000Lossless", local_config: Optional[Dict] = None):
         self.name = name
         self.ae_title = ae_title
         self.ip_address = ip_address
         self.port = port
+        self.transfer_syntax = transfer_syntax
+        self.local_config = local_config  # How this node sees the local server
 
     def __repr__(self):
-        return f"DicomNode({self.name}, {self.ae_title}@{self.ip_address}:{self.port})"
+        return f"DicomNode({self.name}, {self.ae_title}@{self.ip_address}:{self.port}, {self.transfer_syntax})"
 
     def to_dict(self) -> Dict:
-        return {
+        data = {
             "name": self.name,
             "ae_title": self.ae_title,
             "ip_address": self.ip_address,
-            "port": self.port
+            "port": self.port,
+            "transfer_syntax": self.transfer_syntax
         }
+        if self.local_config:
+            data["local_config"] = self.local_config
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'DicomNode':
@@ -80,7 +103,9 @@ class DicomNode:
             name=data["name"],
             ae_title=data["ae_title"],
             ip_address=data["ip_address"],
-            port=data["port"]
+            port=data["port"],
+            transfer_syntax=data.get("transfer_syntax", "JPEG2000Lossless"),
+            local_config=data.get("local_config")  # Optional per-remote local config
         )
 
 
@@ -90,7 +115,7 @@ class DicomConfig:
     def __init__(self, config_file: str = CONFIG_FILE):
         self.config_file = config_file
         self.local_node: Optional[DicomNode] = None
-        self.remote_node: Optional[DicomNode] = None
+        self.remote_nodes: Dict[str, DicomNode] = {}  # Dictionary of remote nodes by short name
 
     def load(self, auto_detect_local_ip: bool = True) -> bool:
         """
@@ -107,7 +132,19 @@ class DicomConfig:
                 data = json.load(f)
 
             self.local_node = DicomNode.from_dict(data["local"])
-            self.remote_node = DicomNode.from_dict(data["remote"])
+
+            # Load remote nodes - support both old single 'remote' and new 'remotes' format
+            if "remotes" in data:
+                # New format: multiple remote nodes
+                for short_name, node_data in data["remotes"].items():
+                    self.remote_nodes[short_name] = DicomNode.from_dict(node_data)
+            elif "remote" in data:
+                # Old format: single remote node - migrate to new format with default name
+                remote_node = DicomNode.from_dict(data["remote"])
+                # Use the node's name as short name, or fallback to "default"
+                short_name = remote_node.name.lower().replace(" ", "_") if remote_node.name else "default"
+                self.remote_nodes[short_name] = remote_node
+                print(f"Migrated old config format: remote node now accessible as '{short_name}'")
 
             # Auto-detect local IP if enabled
             if auto_detect_local_ip:
@@ -128,7 +165,7 @@ class DicomConfig:
         """Save configuration to file"""
         data = {
             "local": self.local_node.to_dict(),
-            "remote": self.remote_node.to_dict()
+            "remotes": {short_name: node.to_dict() for short_name, node in self.remote_nodes.items()}
         }
 
         with open(self.config_file, 'w') as f:
@@ -149,15 +186,70 @@ class DicomConfig:
         self.local_node = DicomNode(local_name, local_ae, local_ip, local_port)
 
         print("\nRemote DICOM Node Configuration:")
-        remote_name = input("  Name (e.g., 'Remote PACS'): ").strip()
-        remote_ae = input("  AE Title: ").strip()
-        remote_ip = input("  IP Address: ").strip()
-        remote_port = int(input("  Port: ").strip())
+        print("You can configure multiple remote nodes.\n")
 
-        self.remote_node = DicomNode(remote_name, remote_ae, remote_ip, remote_port)
+        while True:
+            short_name = input("  Short name for this remote node (e.g., 'ct', 'mri', 'hospital1'): ").strip().lower()
+            if not short_name:
+                print("  Short name cannot be empty!")
+                continue
+            if short_name in self.remote_nodes:
+                print(f"  Node '{short_name}' already exists!")
+                continue
+
+            remote_name = input("  Full name (e.g., 'CT Scanner PACS'): ").strip()
+            remote_ae = input("  AE Title: ").strip()
+            remote_ip = input("  IP Address: ").strip()
+            remote_port = int(input("  Port: ").strip())
+
+            print("\n  Transfer Syntax:")
+            print("    1) JPEG2000Lossless (compressed, default)")
+            print("    2) ExplicitVRLittleEndian (most compatible)")
+            print("    3) ImplicitVRLittleEndian (legacy)")
+            syntax_choice = input("  Choose transfer syntax (1-3, default=1): ").strip()
+
+            if syntax_choice == "2":
+                transfer_syntax = "ExplicitVRLittleEndian"
+            elif syntax_choice == "3":
+                transfer_syntax = "ImplicitVRLittleEndian"
+            else:
+                transfer_syntax = "JPEG2000Lossless"
+
+            # Ask for remote-specific local configuration
+            print("\n  Local Configuration (how this remote knows YOU):")
+            use_custom = input("    Does this remote know you differently than default? (y/n, default=n): ").strip().lower()
+
+            local_config = None
+            if use_custom == 'y':
+                print("    Enter how this remote PACS knows your local server:")
+                local_ae = input("      AE Title: ").strip()
+                local_ip = input("      IP Address: ").strip()
+                local_port = int(input("      Port: ").strip())
+                local_config = {
+                    "ae_title": local_ae,
+                    "ip_address": local_ip,
+                    "port": local_port
+                }
+                print(f"    ✓ Custom local config: {local_ae}@{local_ip}:{local_port}")
+
+            self.remote_nodes[short_name] = DicomNode(remote_name, remote_ae, remote_ip, remote_port,
+                                                     transfer_syntax, local_config)
+            print(f"  ✓ Remote node '{short_name}' added with {transfer_syntax}")
+
+            add_more = input("\n  Add another remote node? (y/n): ").strip().lower()
+            if add_more != 'y':
+                break
 
         print("\nConfiguration complete!")
         self.save()
+
+    def get_remote_node(self, short_name: str) -> Optional[DicomNode]:
+        """Get a remote node by its short name"""
+        return self.remote_nodes.get(short_name)
+
+    def list_remote_nodes(self) -> List[str]:
+        """Get list of all remote node short names"""
+        return list(self.remote_nodes.keys())
 
 
 class DicomSeries:
@@ -208,9 +300,7 @@ class DicomQueryClient:
         self.ae = AE(ae_title=calling_ae_title)
         self.ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
         self.ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
-
-        # Add JPEG 2000 Lossless as preferred transfer syntax
-        self.ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove, JPEG2000Lossless)
+        # Note: Transfer syntax for C-MOVE is set per-node in move_series() method
 
     def query_studies(self, node: DicomNode, date_from: str, date_to: str) -> List[DicomStudy]:
         """
@@ -340,14 +430,16 @@ class DicomQueryClient:
 
         return series_list
 
-    def move_series(self, source_node: DicomNode, dest_ae_title: str, study_uid: str,
-                    series_uid: str) -> bool:
+    def move_series(self, source_node: DicomNode, dest_ae_title: str, dest_ip: str,
+                    dest_port: int, study_uid: str, series_uid: str) -> bool:
         """
         Move a series from source to destination using C-MOVE.
 
         Args:
             source_node: Source DICOM node
-            dest_ae_title: Destination AE title
+            dest_ae_title: Destination AE title (how source knows us)
+            dest_ip: Destination IP address (how source knows us)
+            dest_port: Destination port (how source knows us)
             study_uid: Study Instance UID
             series_uid: Series Instance UID
 
@@ -361,8 +453,24 @@ class DicomQueryClient:
         ds.SeriesInstanceUID = series_uid
 
         try:
+            # Create a new AE for this specific C-MOVE with the node's transfer syntax
+            move_ae = AE(ae_title=self.calling_ae_title)
+
+            # Add the node-specific transfer syntax as preferred
+            transfer_syntax_uid = get_transfer_syntax_uid(source_node.transfer_syntax)
+
+            # Add presentation contexts with multiple transfer syntaxes for better compatibility
+            # Primary: node-specific syntax
+            move_ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove, [
+                transfer_syntax_uid,
+                ImplicitVRLittleEndian  # Always add as fallback
+            ])
+
+            print(f"  Transfer syntax: {source_node.transfer_syntax}")
+            print(f"  C-MOVE destination: {dest_ae_title}@{dest_ip}:{dest_port}")
+
             # Associate with peer AE
-            assoc = self.ae.associate(source_node.ip_address, source_node.port,
+            assoc = move_ae.associate(source_node.ip_address, source_node.port,
                                      ae_title=source_node.ae_title)
 
             if assoc.is_established:
@@ -376,15 +484,22 @@ class DicomQueryClient:
                             continue
                         else:
                             # Failed or warning
+                            print(f"  C-MOVE failed with status: 0x{status.Status:04X}")
+                            if hasattr(status, 'ErrorComment'):
+                                print(f"  Error comment: {status.ErrorComment}")
                             return False
 
                 assoc.release()
                 return True
             else:
+                print(f"  Association rejected or failed to {source_node.name}")
+                print(f"  Rejection reason: {assoc.rejected if hasattr(assoc, 'rejected') else 'Unknown'}")
                 return False
 
         except Exception as e:
-            print(f"Error during C-MOVE: {e}")
+            print(f"  Exception during C-MOVE: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
 
@@ -570,7 +685,8 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
 
 
 def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryClient,
-                               remote_node: DicomNode, local_ae_title: str):
+                               remote_node: DicomNode, local_ae_title: str,
+                               local_ip: str, local_port: int):
     """
     Transfer series sequentially (one at a time) with detailed status output.
 
@@ -578,7 +694,9 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         transfer_list: List of (study, series, local_image_count) tuples to transfer
         client: DICOM query client
         remote_node: Remote node (source)
-        local_ae_title: Local AE title (destination)
+        local_ae_title: Local AE title (how remote knows us)
+        local_ip: Local IP address (how remote knows us)
+        local_port: Local port (how remote knows us)
     """
     if not transfer_list:
         print("\nNo series to transfer")
@@ -615,7 +733,8 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         print(f"  Description: {series.series_description[:60]}")
 
         # Perform the transfer (only one C-MOVE at a time)
-        success = client.move_series(remote_node, local_ae_title, study.study_uid, series.series_uid)
+        success = client.move_series(remote_node, local_ae_title, local_ip, local_port,
+                                     study.study_uid, series.series_uid)
 
         end_timestamp = datetime.now().strftime("%H:%M:%S")
 
@@ -662,8 +781,8 @@ def print_study_table(studies: List[DicomStudy], title: str):
         print(f"{date_formatted:<12} {time_formatted:<10} {patient_name:<25} {desc:<35} {study.num_images:<8}")
 
 
-def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Optional[int] = None,
-                   all_series: bool = False, hours: int = 3):
+def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQueryClient,
+                   min_images: Optional[int] = None, all_series: bool = False, hours: int = 3):
     """Run a single synchronization cycle"""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 100}")
@@ -679,7 +798,7 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Op
     print("\n" + "=" * 80)
     print("Querying Remote Server")
     print("=" * 80)
-    remote_studies_all = client.query_studies(config.remote_node, date_from, date_to)
+    remote_studies_all = client.query_studies(remote_node, date_from, date_to)
 
     # Filter remote studies to last N hours
     remote_studies = [s for s in remote_studies_all if is_within_last_hours(s.study_date, s.study_time, hours)]
@@ -695,7 +814,7 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Op
 
     # Compare series between remote and local for all remote studies
     # This will check which series are missing on local, regardless of whether the study exists locally
-    transfer_list = compare_series_and_filter(remote_studies, client, config.remote_node,
+    transfer_list = compare_series_and_filter(remote_studies, client, remote_node,
                                              config.local_node, min_images=min_images,
                                              all_series=all_series)
 
@@ -713,9 +832,21 @@ def run_sync_cycle(config: DicomConfig, client: DicomQueryClient, min_images: Op
         else:
             print(f"\nFound {len(transfer_list)} series to transfer (smallest missing series from each study)")
 
+        # Determine local config to use (remote-specific or default)
+        if remote_node.local_config:
+            local_ae_title = remote_node.local_config['ae_title']
+            local_ip = remote_node.local_config['ip_address']
+            local_port = remote_node.local_config['port']
+            print(f"\nUsing remote-specific local config: {local_ae_title}@{local_ip}:{local_port}")
+        else:
+            local_ae_title = config.local_node.ae_title
+            local_ip = config.local_node.ip_address
+            local_port = config.local_node.port
+            print(f"\nUsing default local config: {local_ae_title}@{local_ip}:{local_port}")
+
         # Start sequential transfer automatically
-        transfer_series_sequential(transfer_list, client, config.remote_node,
-                                  config.local_node.ae_title)
+        transfer_series_sequential(transfer_list, client, remote_node,
+                                  local_ae_title, local_ip, local_port)
     else:
         print("\nNo series found to transfer. All relevant series are present on local server!")
 
@@ -733,11 +864,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  %(prog)s                           # Transfer only smallest series (default, last 3 hours)
-  %(prog)s --hours 6                # Transfer from last 6 hours
-  %(prog)s --min-images 300         # Transfer all series with < 300 images
-  %(prog)s --all-series              # Transfer all series
+  %(prog)s --node ct                 # Transfer from remote node 'ct' (default mode, last 3 hours)
+  %(prog)s --node mri --hours 6      # Transfer from 'mri' node, last 6 hours
+  %(prog)s --node ct --min-images 300  # Transfer from 'ct', series with < 300 images
+  %(prog)s --node hospital1 --all-series  # Transfer all series from 'hospital1'
         '''
+    )
+
+    parser.add_argument(
+        '--node',
+        type=str,
+        required=True,
+        metavar='NAME',
+        help='Short name of the remote node to sync from (required)'
     )
 
     parser.add_argument(
@@ -790,9 +929,24 @@ Examples:
         print("Please run the configuration setup first.")
         config.interactive_setup()
 
+    # Get the selected remote node
+    remote_node = config.get_remote_node(args.node)
+    if not remote_node:
+        print(f"\n❌ Error: Remote node '{args.node}' not found in configuration!")
+        print(f"\nAvailable remote nodes:")
+        available_nodes = config.list_remote_nodes()
+        if available_nodes:
+            for node_name in available_nodes:
+                node = config.get_remote_node(node_name)
+                print(f"  - {node_name}: {node.name} ({node.ae_title}@{node.ip_address}:{node.port})")
+        else:
+            print("  (no remote nodes configured)")
+        print("\nPlease specify a valid remote node with --node <name>")
+        sys.exit(1)
+
     print(f"\nConfiguration loaded:")
     print(f"  Local:  {config.local_node}")
-    print(f"  Remote: {config.remote_node}")
+    print(f"  Remote: {remote_node} (selected: '{args.node}')")
 
     # Create query client
     client = DicomQueryClient()
@@ -814,7 +968,7 @@ Examples:
             print(f"{'#' * 100}")
             print(f"{'#' * 100}")
 
-            run_sync_cycle(config, client, min_images=args.min_images, all_series=args.all_series, hours=args.hours)
+            run_sync_cycle(config, remote_node, client, min_images=args.min_images, all_series=args.all_series, hours=args.hours)
 
             # Wait 60 seconds before next cycle
             print(f"\nWaiting 60 seconds before next sync cycle...")

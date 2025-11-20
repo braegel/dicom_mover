@@ -1,0 +1,14 @@
+{
+  "local": {
+    "name": "kleditsch",
+    "ae_title": "kleditsch",
+    "ip_address": "192.168.1.178",
+    "port": 11112
+  },
+  "remote": {
+    "name": "Telradko",
+    "ae_title": "TZK",
+    "ip_address": "10.1.15.30",
+    "port": 4050
+  }
+}

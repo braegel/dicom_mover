@@ -1,0 +1,25 @@
+{
+  "local": {
+    "name": "kleditsch",
+    "ae_title": "kleditsch",
+    "ip_address": "192.168.1.178",
+    "port": 11112,
+    "transfer_syntax": "JPEG2000Lossless"
+  },
+  "remotes": {
+    "telradko": {
+      "name": "Telradko",
+      "ae_title": "TZK",
+      "ip_address": "10.1.15.30",
+      "port": 4050,
+      "transfer_syntax": "JPEG2000Lossless"
+    },
+    "gerald": {
+      "name": "Gerald PACS",
+      "ae_title": "GERALD",
+      "ip_address": "10.1.15.40",
+      "port": 4051,
+      "transfer_syntax": "ExplicitVRLittleEndian"
+    }
+  }
+}
