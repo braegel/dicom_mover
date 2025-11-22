@@ -515,6 +515,33 @@ def get_date_range() -> tuple:
     return yesterday_str, today_str
 
 
+def parse_day_keyword(day_keyword: str) -> tuple:
+    """
+    Parse a day keyword and return date range for that single day.
+
+    Args:
+        day_keyword: One of 'today', 'yesterday', or a date in YYYYMMDD format
+
+    Returns:
+        Tuple of (date_from, date_to) in YYYYMMDD format (same day for both)
+    """
+    today = datetime.now()
+
+    if day_keyword.lower() == 'today':
+        target_date = today
+    elif day_keyword.lower() == 'yesterday':
+        target_date = today - timedelta(days=1)
+    else:
+        # Try to parse as YYYYMMDD format
+        try:
+            target_date = datetime.strptime(day_keyword, "%Y%m%d")
+        except ValueError:
+            raise ValueError(f"Invalid day keyword: '{day_keyword}'. Use 'today', 'yesterday', or YYYYMMDD format")
+
+    date_str = target_date.strftime("%Y%m%d")
+    return date_str, date_str
+
+
 def is_within_last_hours(study_date: str, study_time: str, hours: int = 3) -> bool:
     """
     Check if a study is within the last N hours.
@@ -782,17 +809,24 @@ def print_study_table(studies: List[DicomStudy], title: str):
 
 
 def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQueryClient,
-                   min_images: Optional[int] = None, all_series: bool = False, hours: int = 3):
+                   min_images: Optional[int] = None, all_series: bool = False, hours: int = 3,
+                   download_day: Optional[str] = None):
     """Run a single synchronization cycle"""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 100}")
     print(f"Starting sync cycle at {current_time}")
     print(f"{'=' * 100}")
 
-    # Get date range (yesterday and today)
-    date_from, date_to = get_date_range()
-    print(f"Searching for studies from {date_from} to {date_to}")
-    print(f"Filtering studies within last {hours} hours")
+    # Get date range
+    if download_day:
+        date_from, date_to = parse_day_keyword(download_day)
+        print(f"Searching for ALL studies from day: {date_from}")
+        filter_by_hours = False
+    else:
+        date_from, date_to = get_date_range()
+        print(f"Searching for studies from {date_from} to {date_to}")
+        print(f"Filtering studies within last {hours} hours")
+        filter_by_hours = True
 
     # Query remote server
     print("\n" + "=" * 80)
@@ -800,12 +834,19 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
     print("=" * 80)
     remote_studies_all = client.query_studies(remote_node, date_from, date_to)
 
-    # Filter remote studies to last N hours
-    remote_studies = [s for s in remote_studies_all if is_within_last_hours(s.study_date, s.study_time, hours)]
-    print(f"Filtered to {len(remote_studies)} studies within last {hours} hours (from {len(remote_studies_all)} total)")
+    # Filter remote studies to last N hours (only if not in download-day mode)
+    if filter_by_hours:
+        remote_studies = [s for s in remote_studies_all if is_within_last_hours(s.study_date, s.study_time, hours)]
+        print(f"Filtered to {len(remote_studies)} studies within last {hours} hours (from {len(remote_studies_all)} total)")
+    else:
+        remote_studies = remote_studies_all
+        print(f"Found {len(remote_studies)} studies on {date_from}")
 
     if not remote_studies:
-        print(f"\nNo remote studies found within last {hours} hours")
+        if filter_by_hours:
+            print(f"\nNo remote studies found within last {hours} hours")
+        else:
+            print(f"\nNo remote studies found on {date_from}")
         cycle_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n{'=' * 100}")
         print(f"Sync cycle completed at {cycle_end_time}")
@@ -868,6 +909,8 @@ Examples:
   %(prog)s --node mri --hours 6      # Transfer from 'mri' node, last 6 hours
   %(prog)s --node ct --min-images 300  # Transfer from 'ct', series with < 300 images
   %(prog)s --node hospital1 --all-series  # Transfer all series from 'hospital1'
+  %(prog)s --node ct --download-day yesterday  # Download ALL series from yesterday
+  %(prog)s --node mri --download-day 20231225  # Download ALL series from specific date
         '''
     )
 
@@ -884,7 +927,14 @@ Examples:
         type=int,
         default=3,
         metavar='N',
-        help='Number of hours to look back for studies (default: 3)'
+        help='Number of hours to look back for studies (default: 3, ignored with --download-day)'
+    )
+
+    parser.add_argument(
+        '--download-day',
+        type=str,
+        metavar='DAY',
+        help='Download ALL series from a specific day (e.g., "yesterday", "today", or "20231225")'
     )
 
     group = parser.add_mutually_exclusive_group()
@@ -913,13 +963,23 @@ Examples:
     print("=" * 80)
 
     # Display transfer mode and time window
-    print(f"\nTime window: Last {args.hours} hours")
-    if args.all_series:
-        print("Transfer mode: ALL SERIES")
-    elif args.min_images is not None:
-        print(f"Transfer mode: Series with < {args.min_images} images")
+    if args.download_day:
+        print(f"\nMode: DOWNLOAD ALL from day '{args.download_day}'")
+        if args.all_series:
+            print("Transfer mode: ALL SERIES from that day")
+        elif args.min_images is not None:
+            print(f"Transfer mode: Series with < {args.min_images} images from that day")
+        else:
+            print("Transfer mode: ALL SERIES from that day (download-day forces all-series)")
+            args.all_series = True  # Force all-series mode when downloading a specific day
     else:
-        print("Transfer mode: Smallest series only (default)")
+        print(f"\nTime window: Last {args.hours} hours")
+        if args.all_series:
+            print("Transfer mode: ALL SERIES")
+        elif args.min_images is not None:
+            print(f"Transfer mode: Series with < {args.min_images} images")
+        else:
+            print("Transfer mode: Smallest series only (default)")
 
     # Load or create configuration
     config = DicomConfig()
@@ -951,6 +1011,26 @@ Examples:
     # Create query client
     client = DicomQueryClient()
 
+    # If download-day is specified, run once and exit (no continuous sync)
+    if args.download_day:
+        print("\n" + "=" * 80)
+        print("Starting one-time download")
+        print("=" * 80)
+
+        try:
+            run_sync_cycle(config, remote_node, client, min_images=args.min_images,
+                          all_series=args.all_series, hours=args.hours,
+                          download_day=args.download_day)
+        except ValueError as e:
+            print(f"\n❌ Error: {e}")
+            sys.exit(1)
+
+        print("\n" + "=" * 80)
+        print("Download completed")
+        print("=" * 80)
+        sys.exit(0)
+
+    # Normal continuous sync mode
     print("\n" + "=" * 80)
     print("Starting automatic synchronization")
     print("Sync will run every 60 seconds")
@@ -968,7 +1048,9 @@ Examples:
             print(f"{'#' * 100}")
             print(f"{'#' * 100}")
 
-            run_sync_cycle(config, remote_node, client, min_images=args.min_images, all_series=args.all_series, hours=args.hours)
+            run_sync_cycle(config, remote_node, client, min_images=args.min_images,
+                          all_series=args.all_series, hours=args.hours,
+                          download_day=None)
 
             # Wait 60 seconds before next cycle
             print(f"\nWaiting 60 seconds before next sync cycle...")
