@@ -657,36 +657,33 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
                 print(f"      Series {series.series_number}: 0 images - EMPTY (skip)")
                 continue
 
+            # Calculate missing images
+            missing_images = series.num_images - local_image_count
+
+            # CRITICAL: Skip if only 1 image is missing (single images often fail to download)
+            if missing_images < 2:
+                print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - SKIP (only {missing_images} image missing)")
+                continue
+
             # Apply filtering based on selection criteria
             should_transfer = False
             reason = ""
 
             if all_series:
-                # Transfer all incomplete series, but skip if only 1 image missing
-                missing_images = series.num_images - local_image_count
-                if missing_images < 2:
-                    should_transfer = False
-                    reason = f"only {missing_images} image(s) missing (need at least 2)"
-                else:
-                    should_transfer = True
-                    reason = f"all-series mode ({missing_images} images missing)"
+                # Transfer all incomplete series (already filtered for >=2 missing images above)
+                should_transfer = True
+                reason = f"all-series mode ({missing_images} images missing)"
             elif min_images is not None:
-                # Transfer series with fewer than N images
+                # Transfer series with fewer than N images (and >=2 missing)
                 should_transfer = series.num_images < min_images
                 if should_transfer:
-                    reason = f"has {series.num_images} < {min_images} images"
+                    reason = f"has {series.num_images} < {min_images} images ({missing_images} missing)"
                 else:
                     reason = f"has {series.num_images} >= {min_images} images"
             else:
-                # Default mode: Only transfer if at least 2 images are missing
-                missing_images = series.num_images - local_image_count
-                if missing_images < 2:
-                    should_transfer = False
-                    reason = f"only {missing_images} image(s) missing (need at least 2)"
-                else:
-                    # Will select smallest later
-                    should_transfer = True
-                    reason = f"candidate for smallest ({missing_images} images missing)"
+                # Default mode: will select smallest later (already filtered for >=2 missing)
+                should_transfer = True
+                reason = f"candidate for smallest ({missing_images} images missing)"
 
             status = "→ TRANSFER" if should_transfer else "SKIP"
             print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - {status} ({reason})")
