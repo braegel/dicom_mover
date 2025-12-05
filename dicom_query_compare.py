@@ -595,7 +595,7 @@ def compare_studies(remote_studies: List[DicomStudy], local_studies: List[DicomS
 
 def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClient,
                               remote_node: DicomNode, local_node: DicomNode,
-                              min_images: Optional[int] = None,
+                              max_images: Optional[int] = None,
                               all_series: bool = False) -> List[tuple]:
     """
     Query series for each study on both remote and local, then filter incomplete series.
@@ -609,7 +609,7 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
         client: DICOM query client
         remote_node: Remote node to query
         local_node: Local node to query
-        min_images: If set, transfer all series with fewer than this many images
+        max_images: If set, transfer all series with up to this many images
         all_series: If True, transfer all series
 
     Returns:
@@ -618,8 +618,8 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
     transfer_list = []
 
     print(f"\nAnalyzing series in {len(studies)} studies...")
-    if min_images is not None:
-        print(f"  Mode: Transfer series with < {min_images} images")
+    if max_images is not None:
+        print(f"  Mode: Transfer series with ≤ {max_images} images")
     elif all_series:
         print(f"  Mode: Transfer ALL incomplete series")
     else:
@@ -673,13 +673,13 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
                 # Transfer all incomplete series (already filtered for >=2 missing images above)
                 should_transfer = True
                 reason = f"all-series mode ({missing_images} images missing)"
-            elif min_images is not None:
-                # Transfer series with fewer than N images (and >=2 missing)
-                should_transfer = series.num_images < min_images
+            elif max_images is not None:
+                # Transfer series with up to N images (and >=2 missing)
+                should_transfer = series.num_images <= max_images
                 if should_transfer:
-                    reason = f"has {series.num_images} < {min_images} images ({missing_images} missing)"
+                    reason = f"has {series.num_images} ≤ {max_images} images ({missing_images} missing)"
                 else:
-                    reason = f"has {series.num_images} >= {min_images} images"
+                    reason = f"has {series.num_images} > {max_images} images"
             else:
                 # Default mode: will select smallest later (already filtered for >=2 missing)
                 should_transfer = True
@@ -691,8 +691,8 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
             if should_transfer:
                 transfer_list.append((study, series, local_image_count))
 
-    # If default mode (not all_series, not min_images), keep only smallest per study
-    if not all_series and min_images is None and transfer_list:
+    # If default mode (not all_series, not max_images), keep only smallest per study
+    if not all_series and max_images is None and transfer_list:
         # Group by study and keep only smallest series per study
         study_series_map = {}
         for study, series, local_count in transfer_list:
@@ -712,7 +712,7 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
                                remote_node: DicomNode, local_ae_title: str,
                                local_ip: str, local_port: int):
     """
-    Transfer series sequentially (one at a time) with detailed status output.
+    Transfer series sequentially (one at a time) with detailed status output and live speed tracking.
 
     Args:
         transfer_list: List of (study, series, local_image_count) tuples to transfer
@@ -733,7 +733,7 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
     transferred_images = 0
     failed_series = 0
 
-    start_time = time.time()
+    overall_start_time = time.time()
 
     print(f"\nStarting transfer: {total_series} series, {total_images} images")
     print(f"{'=' * 120}\n")
@@ -756,32 +756,47 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         print(f"  Series: {series.series_number} ({series.modality}) - {status_info}")
         print(f"  Description: {series.series_description[:60]}")
 
+        # Track series transfer time
+        series_start_time = time.time()
+
         # Perform the transfer (only one C-MOVE at a time)
         success = client.move_series(remote_node, local_ae_title, local_ip, local_port,
                                      study.study_uid, series.series_uid)
 
+        series_end_time = time.time()
+        series_duration = series_end_time - series_start_time
         end_timestamp = datetime.now().strftime("%H:%M:%S")
 
         if success:
             transferred_series += 1
             transferred_images += series.num_images
+
+            # Calculate speed for this series
+            series_speed = series.num_images / series_duration if series_duration > 0 else 0
+
+            # Calculate running average speed
+            elapsed_time = series_end_time - overall_start_time
+            avg_speed = transferred_images / elapsed_time if elapsed_time > 0 else 0
+
             print(f"[{end_timestamp}] C-MOVE COMPLETE ✓")
+            print(f"  Speed: {series_speed:.1f} img/s (this series) | Average: {avg_speed:.1f} img/s | Time: {series_duration:.1f}s")
         else:
             failed_series += 1
             print(f"[{end_timestamp}] C-MOVE FAILED ✗")
 
         print()  # Empty line between transfers
 
-    total_time = time.time() - start_time
-    final_rate = (transferred_images / total_time * 60) if total_time > 0 else 0
+    total_time = time.time() - overall_start_time
+    final_rate_per_second = transferred_images / total_time if total_time > 0 else 0
+    final_rate_per_minute = final_rate_per_second * 60
 
     print(f"{'=' * 120}")
     print(f"Transfer statistics:")
     print(f"  Successfully transferred: {transferred_series}/{total_series} series ({transferred_images} images)")
     if failed_series > 0:
         print(f"  Failed: {failed_series} series")
-    print(f"  Total time: {total_time/60:.1f} minutes")
-    print(f"  Transfer rate: {final_rate:.1f} images/minute")
+    print(f"  Total time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
+    print(f"  Average transfer rate: {final_rate_per_second:.1f} images/second ({final_rate_per_minute:.1f} images/minute)")
 
 
 def print_study_table(studies: List[DicomStudy], title: str):
@@ -806,7 +821,7 @@ def print_study_table(studies: List[DicomStudy], title: str):
 
 
 def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQueryClient,
-                   min_images: Optional[int] = None, all_series: bool = False, hours: int = 3,
+                   max_images: Optional[int] = None, all_series: bool = False, hours: int = 3,
                    download_day: Optional[str] = None):
     """Run a single synchronization cycle"""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -853,7 +868,7 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
     # Compare series between remote and local for all remote studies
     # This will check which series are missing on local, regardless of whether the study exists locally
     transfer_list = compare_series_and_filter(remote_studies, client, remote_node,
-                                             config.local_node, min_images=min_images,
+                                             config.local_node, max_images=max_images,
                                              all_series=all_series)
 
     # Print results
@@ -865,8 +880,8 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
     if transfer_list:
         if all_series:
             print(f"\nFound {len(transfer_list)} series to transfer (all missing series)")
-        elif min_images is not None:
-            print(f"\nFound {len(transfer_list)} series to transfer (missing series with < {min_images} images)")
+        elif max_images is not None:
+            print(f"\nFound {len(transfer_list)} series to transfer (missing series with ≤ {max_images} images)")
         else:
             print(f"\nFound {len(transfer_list)} series to transfer (smallest missing series from each study)")
 
@@ -904,7 +919,7 @@ def main():
 Examples:
   %(prog)s --node ct                 # Transfer from remote node 'ct' (default mode, last 3 hours)
   %(prog)s --node mri --hours 6      # Transfer from 'mri' node, last 6 hours
-  %(prog)s --node ct --min-images 300  # Transfer from 'ct', series with < 300 images
+  %(prog)s --node ct --max-images 300  # Transfer from 'ct', series with ≤ 300 images
   %(prog)s --node hospital1 --all-series  # Transfer all series from 'hospital1'
   %(prog)s --node ct --download-day yesterday  # Download ALL series from yesterday
   %(prog)s --node mri --download-day 20231225  # Download ALL series from specific date
@@ -936,10 +951,10 @@ Examples:
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
-        '--min-images',
+        '--max-images',
         type=int,
         metavar='N',
-        help='Transfer all series with fewer than N images'
+        help='Transfer all series with up to N images'
     )
     group.add_argument(
         '--all-series',
@@ -964,8 +979,8 @@ Examples:
         print(f"\nMode: DOWNLOAD ALL from day '{args.download_day}'")
         if args.all_series:
             print("Transfer mode: ALL SERIES from that day")
-        elif args.min_images is not None:
-            print(f"Transfer mode: Series with < {args.min_images} images from that day")
+        elif args.max_images is not None:
+            print(f"Transfer mode: Series with ≤ {args.max_images} images from that day")
         else:
             print("Transfer mode: ALL SERIES from that day (download-day forces all-series)")
             args.all_series = True  # Force all-series mode when downloading a specific day
@@ -973,8 +988,8 @@ Examples:
         print(f"\nTime window: Last {args.hours} hours")
         if args.all_series:
             print("Transfer mode: ALL SERIES")
-        elif args.min_images is not None:
-            print(f"Transfer mode: Series with < {args.min_images} images")
+        elif args.max_images is not None:
+            print(f"Transfer mode: Series with ≤ {args.max_images} images")
         else:
             print("Transfer mode: Smallest series only (default)")
 
@@ -1015,7 +1030,7 @@ Examples:
         print("=" * 80)
 
         try:
-            run_sync_cycle(config, remote_node, client, min_images=args.min_images,
+            run_sync_cycle(config, remote_node, client, max_images=args.max_images,
                           all_series=args.all_series, hours=args.hours,
                           download_day=args.download_day)
         except ValueError as e:
@@ -1045,7 +1060,7 @@ Examples:
             print(f"{'#' * 100}")
             print(f"{'#' * 100}")
 
-            run_sync_cycle(config, remote_node, client, min_images=args.min_images,
+            run_sync_cycle(config, remote_node, client, max_images=args.max_images,
                           all_series=args.all_series, hours=args.hours,
                           download_day=None)
 
