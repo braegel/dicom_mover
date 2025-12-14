@@ -477,10 +477,19 @@ class DicomQueryClient:
                 # Send the C-MOVE request
                 responses = assoc.send_c_move(ds, dest_ae_title, StudyRootQueryRetrieveInformationModelMove)
 
+                # Track if we received a final success status
+                success = False
+
+                # Consume ALL responses to ensure C-MOVE completes
                 for (status, identifier) in responses:
                     if status:
-                        # Success or pending
-                        if status.Status in (0xFF00, 0x0000):
+                        # Pending status
+                        if status.Status == 0xFF00:
+                            continue
+                        # Success status
+                        elif status.Status == 0x0000:
+                            success = True
+                            # Continue to consume remaining responses
                             continue
                         else:
                             # Failed or warning
@@ -490,7 +499,7 @@ class DicomQueryClient:
                             return False
 
                 assoc.release()
-                return True
+                return success
             else:
                 print(f"  Association rejected or failed to {source_node.name}")
                 print(f"  Rejection reason: {assoc.rejected if hasattr(assoc, 'rejected') else 'Unknown'}")
@@ -661,7 +670,8 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
             missing_images = series.num_images - local_image_count
 
             # CRITICAL: Skip if only 1 image is missing (single images often fail to download)
-            if missing_images < 2:
+            # EXCEPTION: If max_images filter is active, always download series within that limit (including single images)
+            if missing_images < 2 and max_images is None:
                 print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - SKIP (only {missing_images} image missing)")
                 continue
 
@@ -710,7 +720,7 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
 
 def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryClient,
                                remote_node: DicomNode, local_ae_title: str,
-                               local_ip: str, local_port: int):
+                               local_ip: str, local_port: int) -> int:
     """
     Transfer series sequentially (one at a time) with detailed status output and live speed tracking.
 
@@ -721,10 +731,13 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         local_ae_title: Local AE title (how remote knows us)
         local_ip: Local IP address (how remote knows us)
         local_port: Local port (how remote knows us)
+
+    Returns:
+        Number of images transferred
     """
     if not transfer_list:
         print("\nNo series to transfer")
-        return
+        return 0
 
     total_series = len(transfer_list)
     total_images = sum(series.num_images for _, series, _ in transfer_list)
@@ -798,6 +811,8 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
     print(f"  Total time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
     print(f"  Average transfer rate: {final_rate_per_second:.1f} images/second ({final_rate_per_minute:.1f} images/minute)")
 
+    return transferred_images
+
 
 def print_study_table(studies: List[DicomStudy], title: str):
     """Print studies in a formatted table"""
@@ -822,8 +837,13 @@ def print_study_table(studies: List[DicomStudy], title: str):
 
 def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQueryClient,
                    max_images: Optional[int] = None, all_series: bool = False, hours: int = 3,
-                   download_day: Optional[str] = None):
-    """Run a single synchronization cycle"""
+                   download_day: Optional[str] = None) -> int:
+    """
+    Run a single synchronization cycle
+
+    Returns:
+        Number of images transferred in this cycle
+    """
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 100}")
     print(f"Starting sync cycle at {current_time}")
@@ -863,7 +883,7 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
         print(f"\n{'=' * 100}")
         print(f"Sync cycle completed at {cycle_end_time}")
         print(f"{'=' * 100}")
-        return
+        return 0
 
     # Compare series between remote and local for all remote studies
     # This will check which series are missing on local, regardless of whether the study exists locally
@@ -898,15 +918,18 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
             print(f"\nUsing default local config: {local_ae_title}@{local_ip}:{local_port}")
 
         # Start sequential transfer automatically
-        transfer_series_sequential(transfer_list, client, remote_node,
-                                  local_ae_title, local_ip, local_port)
+        transferred_images = transfer_series_sequential(transfer_list, client, remote_node,
+                                                        local_ae_title, local_ip, local_port)
     else:
         print("\nNo series found to transfer. All relevant series are present on local server!")
+        transferred_images = 0
 
     cycle_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 100}")
     print(f"Sync cycle completed at {cycle_end_time}")
     print(f"{'=' * 100}")
+
+    return transferred_images
 
 
 def main():
@@ -1045,7 +1068,7 @@ Examples:
     # Normal continuous sync mode
     print("\n" + "=" * 80)
     print("Starting automatic synchronization")
-    print("Sync will run every 60 seconds")
+    print("Sync will run every 60 seconds (only if no images transferred)")
     print("Press Ctrl+C to stop")
     print("=" * 80)
 
@@ -1060,13 +1083,17 @@ Examples:
             print(f"{'#' * 100}")
             print(f"{'#' * 100}")
 
-            run_sync_cycle(config, remote_node, client, max_images=args.max_images,
-                          all_series=args.all_series, hours=args.hours,
-                          download_day=None)
+            transferred_images = run_sync_cycle(config, remote_node, client, max_images=args.max_images,
+                                               all_series=args.all_series, hours=args.hours,
+                                               download_day=None)
 
-            # Wait 60 seconds before next cycle
-            print(f"\nWaiting 60 seconds before next sync cycle...")
-            time.sleep(60)
+            # Wait 60 seconds only if no images were transferred
+            if transferred_images == 0:
+                print(f"\nNo images transferred. Waiting 60 seconds before next sync cycle...")
+                time.sleep(60)
+            else:
+                print(f"\nTransferred {transferred_images} images. Starting next cycle immediately...")
+                time.sleep(1)  # Short pause to prevent tight loop
 
     except KeyboardInterrupt:
         print("\n\n" + "=" * 80)
