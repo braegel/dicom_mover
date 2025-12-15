@@ -528,6 +528,52 @@ class DicomQueryClient:
 
         return series_list
 
+    def query_images(self, node: DicomNode, study_uid: str, series_uid: str) -> List[str]:
+        """
+        Query all image SOPInstanceUIDs for a specific series.
+
+        Args:
+            node: DicomNode to query
+            study_uid: Study Instance UID
+            series_uid: Series Instance UID
+
+        Returns:
+            List of SOPInstanceUIDs
+        """
+        # Create the C-FIND query dataset for image level
+        ds = Dataset()
+        ds.QueryRetrieveLevel = 'IMAGE'
+        ds.StudyInstanceUID = study_uid
+        ds.SeriesInstanceUID = series_uid
+        ds.SOPInstanceUID = ''
+
+        image_uids = []
+
+        try:
+            # Associate with peer AE
+            assoc = self.ae.associate(node.ip_address, node.port, ae_title=node.ae_title)
+
+            if assoc.is_established:
+                # Send the C-FIND request
+                responses = assoc.send_c_find(ds, StudyRootQueryRetrieveInformationModelFind)
+
+                for (status, identifier) in responses:
+                    if status:
+                        if status.Status in (0xFF00, 0xFF01):
+                            if identifier:
+                                sop_uid = str(identifier.get('SOPInstanceUID', ''))
+                                if sop_uid:
+                                    image_uids.append(sop_uid)
+                        else:
+                            break
+
+                assoc.release()
+
+        except Exception as e:
+            print(f"Error querying images: {e}")
+
+        return image_uids
+
     def move_series(self, source_node: DicomNode, dest_ae_title: str, dest_ip: str,
                     dest_port: int, study_uid: str, series_uid: str) -> bool:
         """
@@ -607,6 +653,71 @@ class DicomQueryClient:
             print(f"  Exception during C-MOVE: {e}")
             import traceback
             traceback.print_exc()
+            return False
+
+    def move_image(self, source_node: DicomNode, dest_ae_title: str, dest_ip: str,
+                   dest_port: int, study_uid: str, series_uid: str, sop_instance_uid: str) -> bool:
+        """
+        Move a single image from source to destination using C-MOVE.
+
+        Args:
+            source_node: Source DICOM node
+            dest_ae_title: Destination AE title (how source knows us)
+            dest_ip: Destination IP address (how source knows us)
+            dest_port: Destination port (how source knows us)
+            study_uid: Study Instance UID
+            series_uid: Series Instance UID
+            sop_instance_uid: SOP Instance UID of the image
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Create the C-MOVE query dataset for image level
+        ds = Dataset()
+        ds.QueryRetrieveLevel = 'IMAGE'
+        ds.StudyInstanceUID = study_uid
+        ds.SeriesInstanceUID = series_uid
+        ds.SOPInstanceUID = sop_instance_uid
+
+        try:
+            # Create a new AE for this specific C-MOVE
+            move_ae = AE(ae_title=self.calling_ae_title)
+
+            # Add the node-specific transfer syntax
+            transfer_syntax_uid = get_transfer_syntax_uid(source_node.transfer_syntax)
+
+            move_ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove, [
+                transfer_syntax_uid,
+                ImplicitVRLittleEndian
+            ])
+
+            # Associate with peer AE
+            assoc = move_ae.associate(source_node.ip_address, source_node.port,
+                                     ae_title=source_node.ae_title)
+
+            if assoc.is_established:
+                # Send the C-MOVE request
+                responses = assoc.send_c_move(ds, dest_ae_title, StudyRootQueryRetrieveInformationModelMove)
+
+                success = False
+
+                # Consume all responses
+                for (status, identifier) in responses:
+                    if status:
+                        if status.Status == 0xFF00:
+                            continue
+                        elif status.Status == 0x0000:
+                            success = True
+                            continue
+                        else:
+                            return False
+
+                assoc.release()
+                return success
+            else:
+                return False
+
+        except Exception as e:
             return False
 
 
@@ -874,7 +985,8 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
                                remote_node: DicomNode, local_ae_title: str,
                                local_ip: str, local_port: int,
                                local_node: DicomNode,
-                               stability_tracker: Optional[SeriesStabilityTracker] = None) -> int:
+                               stability_tracker: Optional[SeriesStabilityTracker] = None,
+                               use_image_level: bool = False) -> int:
     """
     Transfer series sequentially (one at a time) with detailed status output and live speed tracking.
 
@@ -887,6 +999,7 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         local_port: Local port (how remote knows us)
         local_node: Local node to query for completion
         stability_tracker: Optional tracker to mark series as transferred
+        use_image_level: If True, use IMAGE-level C-MOVE for partial series
 
     Returns:
         Number of images transferred
@@ -928,9 +1041,56 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         # Track series transfer time
         series_start_time = time.time()
 
-        # Perform the transfer (only one C-MOVE at a time)
-        success = client.move_series(remote_node, local_ae_title, local_ip, local_port,
-                                     study.study_uid, series.series_uid)
+        # Determine transfer strategy: IMAGE-level for partial series, SERIES-level for new/mostly missing
+        missing_images = series.num_images - local_count
+        use_image_transfer = False
+
+        if use_image_level and local_count > 0:
+            # Calculate percentage of missing images
+            missing_percentage = missing_images / series.num_images
+
+            # Use IMAGE-level if less than 30% is missing
+            if missing_percentage < 0.3:
+                use_image_transfer = True
+                print(f"  Strategy: IMAGE-level (only {missing_images} of {series.num_images} images missing, {missing_percentage*100:.1f}%)")
+            else:
+                print(f"  Strategy: SERIES-level ({missing_images} of {series.num_images} images missing, {missing_percentage*100:.1f}%)")
+
+        # Perform the transfer
+        if use_image_transfer:
+            # IMAGE-level transfer: Query which images exist, transfer only missing ones
+            print(f"  Querying remote for image list...")
+            remote_image_uids = client.query_images(remote_node, study.study_uid, series.series_uid)
+            print(f"  Found {len(remote_image_uids)} images on remote")
+
+            print(f"  Querying local for image list...")
+            local_image_uids = client.query_images(local_node, study.study_uid, series.series_uid)
+            local_image_uid_set = set(local_image_uids)
+            print(f"  Found {len(local_image_uids)} images on local")
+
+            # Find missing images
+            missing_image_uids = [uid for uid in remote_image_uids if uid not in local_image_uid_set]
+            print(f"  Transferring {len(missing_image_uids)} missing images...")
+
+            success_count = 0
+            for j, image_uid in enumerate(missing_image_uids, 1):
+                if j % 10 == 0 or j == len(missing_image_uids):
+                    print(f"    Progress: {j}/{len(missing_image_uids)} images")
+
+                img_success = client.move_image(remote_node, local_ae_title, local_ip, local_port,
+                                               study.study_uid, series.series_uid, image_uid)
+                if img_success:
+                    success_count += 1
+
+            success = success_count == len(missing_image_uids)
+            if success:
+                print(f"  ✓ All {len(missing_image_uids)} images transferred successfully")
+            else:
+                print(f"  ⚠ Only {success_count}/{len(missing_image_uids)} images transferred")
+        else:
+            # SERIES-level transfer: Transfer entire series
+            success = client.move_series(remote_node, local_ae_title, local_ip, local_port,
+                                         study.study_uid, series.series_uid)
 
         series_end_time = time.time()
         series_duration = series_end_time - series_start_time
@@ -1003,7 +1163,7 @@ def print_study_table(studies: List[DicomStudy], title: str):
 def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQueryClient,
                    stability_tracker: Optional[SeriesStabilityTracker] = None,
                    max_images: Optional[int] = None, all_series: bool = False, hours: int = 3,
-                   download_day: Optional[str] = None) -> int:
+                   download_day: Optional[str] = None, use_image_level: bool = False) -> int:
     """
     Run a single synchronization cycle
 
@@ -1085,7 +1245,8 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
         transferred_images = transfer_series_sequential(transfer_list, client, remote_node,
                                                         local_ae_title, local_ip, local_port,
                                                         config.local_node,
-                                                        stability_tracker=stability_tracker)
+                                                        stability_tracker=stability_tracker,
+                                                        use_image_level=use_image_level)
     else:
         print("\nNo series found to transfer. All relevant series are present on local server!")
         transferred_images = 0
@@ -1157,6 +1318,12 @@ Examples:
         help='Disable automatic local IP detection'
     )
 
+    parser.add_argument(
+        '--image-level',
+        action='store_true',
+        help='Use IMAGE-level C-MOVE for partial series (transfers only missing images)'
+    )
+
     args = parser.parse_args()
 
     print("=" * 80)
@@ -1179,6 +1346,10 @@ Examples:
             print(f"Transfer mode: Series with ≤ {args.max_images} images")
         else:
             print("Transfer mode: All incomplete series (default)")
+
+    # Show IMAGE-level mode if enabled
+    if args.image_level:
+        print("IMAGE-level mode: Enabled (only missing images transferred for partial series)")
 
     # Load or create configuration
     config = DicomConfig()
@@ -1225,7 +1396,8 @@ Examples:
         try:
             run_sync_cycle(config, remote_node, client, stability_tracker=None,
                           max_images=args.max_images, all_series=args.all_series,
-                          hours=args.hours, download_day=args.download_day)
+                          hours=args.hours, download_day=args.download_day,
+                          use_image_level=args.image_level)
         except ValueError as e:
             print(f"\n❌ Error: {e}")
             sys.exit(1)
@@ -1261,7 +1433,8 @@ Examples:
                                                stability_tracker=stability_tracker,
                                                max_images=args.max_images,
                                                all_series=args.all_series, hours=args.hours,
-                                               download_day=None)
+                                               download_day=None,
+                                               use_image_level=args.image_level)
 
             # Save stability tracker state after each cycle
             if stability_tracker:
