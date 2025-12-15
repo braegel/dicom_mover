@@ -38,6 +38,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pydicom.valuerep
 
 
 CONFIG_FILE = "dicom_config.json"
+STABILITY_TRACKER_FILE = "series_stability.json"
 
 # Transfer syntax mapping
 TRANSFER_SYNTAX_MAP = {
@@ -68,6 +69,103 @@ def detect_local_ip() -> Optional[str]:
         return local_ip if not local_ip.startswith('127.') else None
     except Exception:
         return None
+
+
+class SeriesStabilityTracker:
+    """
+    Tracks series image counts across sync cycles to detect when series are stable.
+    A series is considered stable when its image count hasn't changed between cycles.
+    This prevents transferring incomplete series that are still being uploaded.
+    """
+
+    def __init__(self, tracker_file: str = STABILITY_TRACKER_FILE):
+        self.tracker_file = tracker_file
+        self.series_states: Dict[str, Dict] = {}
+        self.load()
+
+    def _make_key(self, remote_node_name: str, study_uid: str, series_uid: str) -> str:
+        """Create a unique key for a series"""
+        return f"{remote_node_name}|{study_uid}|{series_uid}"
+
+    def load(self):
+        """Load tracker state from file"""
+        if os.path.exists(self.tracker_file):
+            try:
+                with open(self.tracker_file, 'r') as f:
+                    self.series_states = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                self.series_states = {}
+
+    def save(self):
+        """Save tracker state to file"""
+        try:
+            with open(self.tracker_file, 'w') as f:
+                json.dump(self.series_states, f, indent=2)
+        except IOError as e:
+            print(f"Warning: Could not save stability tracker: {e}")
+
+    def update_series(self, remote_node_name: str, study_uid: str, series_uid: str,
+                     image_count: int) -> bool:
+        """
+        Update series state and return whether it's stable for transfer.
+
+        Returns:
+            True if series is stable (unchanged from last cycle), False otherwise
+        """
+        key = self._make_key(remote_node_name, study_uid, series_uid)
+        now = datetime.now().isoformat()
+
+        if key in self.series_states:
+            old_count = self.series_states[key]['image_count']
+
+            if old_count == image_count:
+                # Image count unchanged - series is stable
+                self.series_states[key]['last_seen'] = now
+                self.series_states[key]['stable_since'] = self.series_states[key].get('stable_since', now)
+                return True
+            else:
+                # Image count changed - series is still growing
+                self.series_states[key] = {
+                    'image_count': image_count,
+                    'last_seen': now,
+                    'stable_since': None
+                }
+                return False
+        else:
+            # First time seeing this series - wait for next cycle
+            self.series_states[key] = {
+                'image_count': image_count,
+                'last_seen': now,
+                'stable_since': None
+            }
+            return False
+
+    def mark_transferred(self, remote_node_name: str, study_uid: str, series_uid: str):
+        """Remove series from tracker after successful transfer"""
+        key = self._make_key(remote_node_name, study_uid, series_uid)
+        if key in self.series_states:
+            del self.series_states[key]
+
+    def cleanup_old_entries(self, max_age_hours: int = 48):
+        """Remove series that haven't been seen in max_age_hours"""
+        now = datetime.now()
+        keys_to_remove = []
+
+        for key, state in self.series_states.items():
+            try:
+                last_seen = datetime.fromisoformat(state['last_seen'])
+                age_hours = (now - last_seen).total_seconds() / 3600
+                if age_hours > max_age_hours:
+                    keys_to_remove.append(key)
+            except (ValueError, KeyError):
+                # Invalid timestamp - remove entry
+                keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            del self.series_states[key]
+
+        if keys_to_remove:
+            print(f"Cleaned up {len(keys_to_remove)} old series from stability tracker")
 
 
 class DicomNode:
@@ -604,6 +702,7 @@ def compare_studies(remote_studies: List[DicomStudy], local_studies: List[DicomS
 
 def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClient,
                               remote_node: DicomNode, local_node: DicomNode,
+                              stability_tracker: Optional[SeriesStabilityTracker] = None,
                               max_images: Optional[int] = None,
                               all_series: bool = False) -> List[tuple]:
     """
@@ -618,6 +717,7 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
         client: DICOM query client
         remote_node: Remote node to query
         local_node: Local node to query
+        stability_tracker: Optional tracker to ensure series are stable before transfer
         max_images: If set, transfer all series with up to this many images
         all_series: If True, transfer all series
 
@@ -629,10 +729,8 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
     print(f"\nAnalyzing series in {len(studies)} studies...")
     if max_images is not None:
         print(f"  Mode: Transfer series with ≤ {max_images} images")
-    elif all_series:
-        print(f"  Mode: Transfer ALL incomplete series")
     else:
-        print(f"  Mode: Transfer smallest series per study (default)")
+        print(f"  Mode: Transfer all incomplete series (default)")
 
     for i, study in enumerate(studies, 1):
         print(f"  [{i}/{len(studies)}] Checking series for {study.patient_name} ({study.study_date})...")
@@ -669,31 +767,36 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
             # Calculate missing images
             missing_images = series.num_images - local_image_count
 
-            # CRITICAL: Skip if only 1 image is missing (single images often fail to download)
-            # EXCEPTION: If max_images filter is active, always download series within that limit (including single images)
-            if missing_images < 2 and max_images is None:
-                print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - SKIP (only {missing_images} image missing)")
+            # CRITICAL: Skip if only 1-3 images are missing from larger series (>10 images)
+            # Small series (<=10 images) with few missing images are allowed
+            if missing_images <= 3 and series.num_images > 10:
+                print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - SKIP (only {missing_images} images missing, series > 10 images)")
                 continue
+
+            # Check series stability if tracker is enabled
+            if stability_tracker:
+                is_stable = stability_tracker.update_series(
+                    remote_node.name, study.study_uid, series.series_uid, series.num_images
+                )
+                if not is_stable:
+                    print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - WAIT (series not yet stable, checking again next cycle)")
+                    continue
 
             # Apply filtering based on selection criteria
             should_transfer = False
             reason = ""
 
-            if all_series:
-                # Transfer all incomplete series (already filtered for >=2 missing images above)
-                should_transfer = True
-                reason = f"all-series mode ({missing_images} images missing)"
-            elif max_images is not None:
-                # Transfer series with up to N images (and >=2 missing)
+            if max_images is not None:
+                # Transfer series with up to N images
                 should_transfer = series.num_images <= max_images
                 if should_transfer:
                     reason = f"has {series.num_images} ≤ {max_images} images ({missing_images} missing)"
                 else:
                     reason = f"has {series.num_images} > {max_images} images"
             else:
-                # Default mode: will select smallest later (already filtered for >=2 missing)
+                # Default mode: transfer all incomplete series (like --all-series)
                 should_transfer = True
-                reason = f"candidate for smallest ({missing_images} images missing)"
+                reason = f"incomplete ({missing_images} images missing)"
 
             status = "→ TRANSFER" if should_transfer else "SKIP"
             print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - {status} ({reason})")
@@ -701,26 +804,77 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
             if should_transfer:
                 transfer_list.append((study, series, local_image_count))
 
-    # If default mode (not all_series, not max_images), keep only smallest per study
-    if not all_series and max_images is None and transfer_list:
-        # Group by study and keep only smallest series per study
-        study_series_map = {}
-        for study, series, local_count in transfer_list:
-            if study.study_uid not in study_series_map:
-                study_series_map[study.study_uid] = (study, series, local_count)
-            else:
-                _, existing_series, existing_local_count = study_series_map[study.study_uid]
-                if series.num_images < existing_series.num_images:
-                    study_series_map[study.study_uid] = (study, series, local_count)
-
-        transfer_list = list(study_series_map.values())
-
     return transfer_list
+
+
+def wait_for_series_completion(client: DicomQueryClient, local_node: DicomNode,
+                               study_uid: str, series_uid: str, expected_images: int,
+                               timeout: int = 60, check_interval: float = 1.5) -> bool:
+    """
+    Wait for a series to complete transfer by monitoring the local server.
+
+    Args:
+        client: DICOM query client
+        local_node: Local node to query
+        study_uid: Study Instance UID
+        series_uid: Series Instance UID
+        expected_images: Expected number of images
+        timeout: Maximum time to wait in seconds
+        check_interval: Time between checks in seconds
+
+    Returns:
+        True if series completed successfully, False if timeout
+    """
+    start_time = time.time()
+    last_count = 0
+    stable_count = 0
+
+    while time.time() - start_time < timeout:
+        # Query local server for this series
+        series_list = client.query_series(local_node, study_uid)
+
+        # Find our specific series
+        current_count = 0
+        for series in series_list:
+            if series.series_uid == series_uid:
+                current_count = series.num_images
+                break
+
+        # Check if we reached expected count
+        if current_count >= expected_images:
+            print(f"    ✓ Series complete: {current_count}/{expected_images} images arrived")
+            return True
+
+        # Check if count is stable (no new images arriving)
+        if current_count == last_count:
+            stable_count += 1
+            # If count hasn't changed for 3 checks (4.5 seconds), consider it done
+            if stable_count >= 3:
+                if current_count > 0:
+                    print(f"    ⚠ Transfer may be incomplete: {current_count}/{expected_images} images (no new images for {stable_count * check_interval:.1f}s)")
+                    return True  # Accept partial transfer
+                else:
+                    # No images arrived at all - likely a failed transfer
+                    print(f"    ✗ No images arrived after {stable_count * check_interval:.1f}s - transfer failed")
+                    return False
+        else:
+            # Count changed, reset stable counter
+            stable_count = 0
+            print(f"    → Receiving: {current_count}/{expected_images} images...")
+
+        last_count = current_count
+        time.sleep(check_interval)
+
+    # Timeout reached
+    print(f"    ✗ Timeout after {timeout}s: {last_count}/{expected_images} images")
+    return False
 
 
 def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryClient,
                                remote_node: DicomNode, local_ae_title: str,
-                               local_ip: str, local_port: int) -> int:
+                               local_ip: str, local_port: int,
+                               local_node: DicomNode,
+                               stability_tracker: Optional[SeriesStabilityTracker] = None) -> int:
     """
     Transfer series sequentially (one at a time) with detailed status output and live speed tracking.
 
@@ -731,6 +885,8 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
         local_ae_title: Local AE title (how remote knows us)
         local_ip: Local IP address (how remote knows us)
         local_port: Local port (how remote knows us)
+        local_node: Local node to query for completion
+        stability_tracker: Optional tracker to mark series as transferred
 
     Returns:
         Number of images transferred
@@ -784,6 +940,10 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
             transferred_series += 1
             transferred_images += series.num_images
 
+            # Mark series as transferred in stability tracker
+            if stability_tracker:
+                stability_tracker.mark_transferred(remote_node.name, study.study_uid, series.series_uid)
+
             # Calculate speed for this series
             series_speed = series.num_images / series_duration if series_duration > 0 else 0
 
@@ -793,6 +953,11 @@ def transfer_series_sequential(transfer_list: List[tuple], client: DicomQueryCli
 
             print(f"[{end_timestamp}] C-MOVE COMPLETE ✓")
             print(f"  Speed: {series_speed:.1f} img/s (this series) | Average: {avg_speed:.1f} img/s | Time: {series_duration:.1f}s")
+
+            # Wait for images to actually arrive by monitoring local server
+            print(f"  Monitoring local server for image arrival...")
+            wait_for_series_completion(client, local_node, study.study_uid, series.series_uid,
+                                      series.num_images, timeout=60, check_interval=1.5)
         else:
             failed_series += 1
             print(f"[{end_timestamp}] C-MOVE FAILED ✗")
@@ -836,6 +1001,7 @@ def print_study_table(studies: List[DicomStudy], title: str):
 
 
 def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQueryClient,
+                   stability_tracker: Optional[SeriesStabilityTracker] = None,
                    max_images: Optional[int] = None, all_series: bool = False, hours: int = 3,
                    download_day: Optional[str] = None) -> int:
     """
@@ -888,8 +1054,8 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
     # Compare series between remote and local for all remote studies
     # This will check which series are missing on local, regardless of whether the study exists locally
     transfer_list = compare_series_and_filter(remote_studies, client, remote_node,
-                                             config.local_node, max_images=max_images,
-                                             all_series=all_series)
+                                             config.local_node, stability_tracker=stability_tracker,
+                                             max_images=max_images, all_series=all_series)
 
     # Print results
     print("\n" + "=" * 80)
@@ -898,12 +1064,10 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
     print(f"Remote studies found: {len(remote_studies)}")
 
     if transfer_list:
-        if all_series:
-            print(f"\nFound {len(transfer_list)} series to transfer (all missing series)")
-        elif max_images is not None:
+        if max_images is not None:
             print(f"\nFound {len(transfer_list)} series to transfer (missing series with ≤ {max_images} images)")
         else:
-            print(f"\nFound {len(transfer_list)} series to transfer (smallest missing series from each study)")
+            print(f"\nFound {len(transfer_list)} series to transfer (all incomplete series)")
 
         # Determine local config to use (remote-specific or default)
         if remote_node.local_config:
@@ -919,7 +1083,9 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
 
         # Start sequential transfer automatically
         transferred_images = transfer_series_sequential(transfer_list, client, remote_node,
-                                                        local_ae_title, local_ip, local_port)
+                                                        local_ae_title, local_ip, local_port,
+                                                        config.local_node,
+                                                        stability_tracker=stability_tracker)
     else:
         print("\nNo series found to transfer. All relevant series are present on local server!")
         transferred_images = 0
@@ -1009,12 +1175,10 @@ Examples:
             args.all_series = True  # Force all-series mode when downloading a specific day
     else:
         print(f"\nTime window: Last {args.hours} hours")
-        if args.all_series:
-            print("Transfer mode: ALL SERIES")
-        elif args.max_images is not None:
+        if args.max_images is not None:
             print(f"Transfer mode: Series with ≤ {args.max_images} images")
         else:
-            print("Transfer mode: Smallest series only (default)")
+            print("Transfer mode: All incomplete series (default)")
 
     # Load or create configuration
     config = DicomConfig()
@@ -1046,6 +1210,12 @@ Examples:
     # Create query client
     client = DicomQueryClient()
 
+    # Create series stability tracker (only for continuous sync mode)
+    stability_tracker = None
+    if not args.download_day:
+        stability_tracker = SeriesStabilityTracker()
+        print(f"  Stability tracking: Enabled (prevents transferring incomplete series)")
+
     # If download-day is specified, run once and exit (no continuous sync)
     if args.download_day:
         print("\n" + "=" * 80)
@@ -1053,9 +1223,9 @@ Examples:
         print("=" * 80)
 
         try:
-            run_sync_cycle(config, remote_node, client, max_images=args.max_images,
-                          all_series=args.all_series, hours=args.hours,
-                          download_day=args.download_day)
+            run_sync_cycle(config, remote_node, client, stability_tracker=None,
+                          max_images=args.max_images, all_series=args.all_series,
+                          hours=args.hours, download_day=args.download_day)
         except ValueError as e:
             print(f"\n❌ Error: {e}")
             sys.exit(1)
@@ -1068,7 +1238,7 @@ Examples:
     # Normal continuous sync mode
     print("\n" + "=" * 80)
     print("Starting automatic synchronization")
-    print("Sync will run every 60 seconds (only if no images transferred)")
+    print("Sync will run every 60 seconds (pauses only if <30 images transferred)")
     print("Press Ctrl+C to stop")
     print("=" * 80)
 
@@ -1083,16 +1253,26 @@ Examples:
             print(f"{'#' * 100}")
             print(f"{'#' * 100}")
 
-            transferred_images = run_sync_cycle(config, remote_node, client, max_images=args.max_images,
+            # Clean up old entries from stability tracker every 10 cycles
+            if stability_tracker and cycle_count % 10 == 0:
+                stability_tracker.cleanup_old_entries()
+
+            transferred_images = run_sync_cycle(config, remote_node, client,
+                                               stability_tracker=stability_tracker,
+                                               max_images=args.max_images,
                                                all_series=args.all_series, hours=args.hours,
                                                download_day=None)
 
-            # Wait 60 seconds only if no images were transferred
-            if transferred_images == 0:
-                print(f"\nNo images transferred. Waiting 60 seconds before next sync cycle...")
+            # Save stability tracker state after each cycle
+            if stability_tracker:
+                stability_tracker.save()
+
+            # Wait 60 seconds if fewer than 30 images were transferred
+            if transferred_images < 30:
+                print(f"\nTransferred {transferred_images} images. Waiting 60 seconds before next sync cycle...")
                 time.sleep(60)
             else:
-                print(f"\nTransferred {transferred_images} images. Starting next cycle immediately...")
+                print(f"\nTransferred {transferred_images} images (≥30). Starting next cycle immediately...")
                 time.sleep(1)  # Short pause to prevent tight loop
 
     except KeyboardInterrupt:
