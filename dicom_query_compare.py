@@ -11,10 +11,13 @@ License: MIT
 """
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import socket
 import sys
+import threading
 import time
 import warnings
 from datetime import datetime, timedelta
@@ -30,7 +33,8 @@ from pydicom.uid import (
 from pynetdicom import AE, debug_logger, evt
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
-    StudyRootQueryRetrieveInformationModelMove
+    StudyRootQueryRetrieveInformationModelMove,
+    Verification as VerificationSOPClass
 )
 
 # Suppress pydicom validation warnings for malformed UIDs from remote PACS
@@ -39,6 +43,8 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pydicom.valuerep
 
 CONFIG_FILE = "dicom_config.json"
 STABILITY_TRACKER_FILE = "series_stability.json"
+PREFERENCES_FILE = "dicom_preferences.json"
+DEFAULT_OSIRIX_PATH = "~/Documents/OsiriX Data/INCOMING.noindex"
 
 # Transfer syntax mapping
 TRANSFER_SYNTAX_MAP = {
@@ -720,6 +726,270 @@ class DicomQueryClient:
         except Exception as e:
             return False
 
+    def echo_test(self, node: DicomNode, timeout: int = 5) -> bool:
+        """
+        Test if a DICOM node is reachable using C-ECHO.
+
+        Args:
+            node: DicomNode to test
+            timeout: Timeout in seconds
+
+        Returns:
+            True if node responds, False otherwise
+        """
+        try:
+            # Create a temporary AE for echo test
+            echo_ae = AE(ae_title=self.calling_ae_title)
+            echo_ae.add_requested_context(VerificationSOPClass)
+
+            # Set association timeout
+            assoc = echo_ae.associate(node.ip_address, node.port,
+                                     ae_title=node.ae_title,
+                                     max_pdu=16382)
+
+            if assoc.is_established:
+                # Send C-ECHO
+                status = assoc.send_c_echo()
+                assoc.release()
+
+                # Check if echo was successful
+                return status and status.Status == 0x0000
+            else:
+                return False
+
+        except Exception as e:
+            return False
+
+
+class DicomStorageSCP:
+    """
+    DICOM Storage SCP Server for receiving DICOM files.
+    Runs in a background thread.
+    """
+
+    def __init__(self, ae_title: str, port: int, storage_dir: str):
+        """
+        Initialize the Storage SCP server.
+
+        Args:
+            ae_title: AE title for this SCP
+            port: Port to listen on
+            storage_dir: Directory to store received DICOM files
+        """
+        self.ae_title = ae_title
+        self.port = port
+        self.storage_dir = Path(storage_dir).expanduser()
+        self.ae = None
+        self.server_thread = None
+        self.running = False
+
+        # Create storage directory if it doesn't exist
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def handle_store(self, event):
+        """Handle a C-STORE request"""
+        try:
+            # Get the dataset from the request
+            ds = event.dataset
+            ds.file_meta = event.file_meta
+
+            # Generate filename from SOPInstanceUID
+            filename = f"{ds.SOPInstanceUID}.dcm"
+            filepath = self.storage_dir / filename
+
+            # Save the dataset
+            ds.save_as(filepath, write_like_original=False)
+
+            # Return success status
+            return 0x0000
+        except Exception as e:
+            print(f"Error storing DICOM file: {e}")
+            return 0xC000  # Failure status
+
+    def start(self):
+        """Start the SCP server in a background thread"""
+        if self.running:
+            print("SCP server is already running")
+            return
+
+        print(f"\nStarting DICOM Storage SCP...")
+        print(f"  AE Title: {self.ae_title}")
+        print(f"  Port: {self.port}")
+        print(f"  Storage Directory: {self.storage_dir}")
+
+        # Create Application Entity
+        self.ae = AE(ae_title=self.ae_title)
+
+        # Add all storage SOP classes (for maximum compatibility)
+        from pynetdicom.sop_class import (
+            CTImageStorage, MRImageStorage, UltrasoundImageStorage,
+            SecondaryCaptureImageStorage, XRayAngiographicImageStorage,
+            XRayRadiofluoroscopicImageStorage, NuclearMedicineImageStorage,
+            PositronEmissionTomographyImageStorage,
+            RTImageStorage, RTDoseStorage, RTStructureSetStorage,
+            DigitalXRayImageStorageForPresentation,
+            DigitalXRayImageStorageForProcessing,
+            ComputedRadiographyImageStorage,
+            EnhancedCTImageStorage, EnhancedMRImageStorage,
+            EnhancedXAImageStorage, EnhancedXRFImageStorage
+        )
+
+        storage_classes = [
+            CTImageStorage, MRImageStorage, UltrasoundImageStorage,
+            SecondaryCaptureImageStorage, XRayAngiographicImageStorage,
+            XRayRadiofluoroscopicImageStorage, NuclearMedicineImageStorage,
+            PositronEmissionTomographyImageStorage,
+            RTImageStorage, RTDoseStorage, RTStructureSetStorage,
+            DigitalXRayImageStorageForPresentation,
+            DigitalXRayImageStorageForProcessing,
+            ComputedRadiographyImageStorage,
+            EnhancedCTImageStorage, EnhancedMRImageStorage,
+            EnhancedXAImageStorage, EnhancedXRFImageStorage
+        ]
+
+        for storage_class in storage_classes:
+            self.ae.add_supported_context(storage_class, [
+                ImplicitVRLittleEndian,
+                ExplicitVRLittleEndian,
+                JPEG2000Lossless
+            ])
+
+        # Add verification for C-ECHO
+        self.ae.add_supported_context(VerificationSOPClass)
+
+        # Set event handler for C-STORE
+        handlers = [(evt.EVT_C_STORE, self.handle_store)]
+
+        # Start server in background thread
+        self.running = True
+        self.server_thread = threading.Thread(
+            target=self._run_server,
+            args=(handlers,),
+            daemon=True
+        )
+        self.server_thread.start()
+
+        # Wait a moment for server to start
+        time.sleep(1)
+        print("  Status: Running")
+
+    def _run_server(self, handlers):
+        """Internal method to run the server"""
+        try:
+            self.ae.start_server(
+                ('', self.port),
+                block=True,
+                evt_handlers=handlers
+            )
+        except Exception as e:
+            print(f"SCP server error: {e}")
+            self.running = False
+
+    def stop(self):
+        """Stop the SCP server"""
+        if not self.running:
+            return
+
+        print("\nStopping DICOM Storage SCP...")
+        self.running = False
+
+        if self.ae:
+            self.ae.shutdown()
+
+        if self.server_thread and self.server_thread.is_alive():
+            self.server_thread.join(timeout=5)
+
+        print("  Status: Stopped")
+
+
+class PreferencesManager:
+    """Manages user preferences like OsiriX storage path"""
+
+    def __init__(self, prefs_file: str = PREFERENCES_FILE):
+        self.prefs_file = prefs_file
+        self.osirix_path = None
+        self.load()
+
+    def load(self):
+        """Load preferences from file"""
+        if os.path.exists(self.prefs_file):
+            try:
+                with open(self.prefs_file, 'r') as f:
+                    data = json.load(f)
+                    self.osirix_path = data.get('osirix_path')
+            except (json.JSONDecodeError, IOError):
+                pass
+
+    def save(self):
+        """Save preferences to file"""
+        try:
+            data = {}
+            if self.osirix_path:
+                data['osirix_path'] = self.osirix_path
+
+            with open(self.prefs_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except IOError as e:
+            print(f"Warning: Could not save preferences: {e}")
+
+    def get_osirix_path(self) -> str:
+        """
+        Get OsiriX storage path, asking user if not configured.
+
+        Returns:
+            Validated path to OsiriX INCOMING directory
+        """
+        # If already configured, validate and return
+        if self.osirix_path:
+            expanded_path = os.path.expanduser(self.osirix_path)
+            if os.path.exists(expanded_path):
+                return expanded_path
+            else:
+                print(f"\nWarning: Previously configured path does not exist: {self.osirix_path}")
+
+        # Try default path first
+        default_expanded = os.path.expanduser(DEFAULT_OSIRIX_PATH)
+        if os.path.exists(default_expanded):
+            print(f"\nFound OsiriX INCOMING directory at default location:")
+            print(f"  {DEFAULT_OSIRIX_PATH}")
+            use_default = input("Use this path? (y/n, default=y): ").strip().lower()
+            if use_default != 'n':
+                self.osirix_path = DEFAULT_OSIRIX_PATH
+                self.save()
+                return default_expanded
+
+        # Ask user for path
+        print(f"\nOsiriX INCOMING directory not found at default location:")
+        print(f"  {DEFAULT_OSIRIX_PATH}")
+        print("\nPlease enter the path to your OsiriX INCOMING directory:")
+        print("(This is typically: ~/Documents/OsiriX Data/INCOMING.noindex)")
+
+        while True:
+            user_path = input("Path: ").strip()
+            if not user_path:
+                print("Path cannot be empty!")
+                continue
+
+            expanded_path = os.path.expanduser(user_path)
+            if os.path.exists(expanded_path):
+                self.osirix_path = user_path
+                self.save()
+                print(f"Path saved: {user_path}")
+                return expanded_path
+            else:
+                print(f"Path does not exist: {expanded_path}")
+                create = input("Create this directory? (y/n): ").strip().lower()
+                if create == 'y':
+                    try:
+                        os.makedirs(expanded_path, exist_ok=True)
+                        self.osirix_path = user_path
+                        self.save()
+                        print(f"Directory created and path saved: {user_path}")
+                        return expanded_path
+                    except OSError as e:
+                        print(f"Failed to create directory: {e}")
+                        continue
+
 
 
 def get_date_range() -> tuple:
@@ -1259,8 +1529,34 @@ def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQue
     return transferred_images
 
 
+# Global variable to track SCP server for cleanup
+_scp_server = None
+
+
+def cleanup_scp_server():
+    """Cleanup function to stop SCP server on exit"""
+    global _scp_server
+    if _scp_server and _scp_server.running:
+        print("\n\nCleaning up...")
+        _scp_server.stop()
+
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals"""
+    print("\n\nReceived interrupt signal...")
+    cleanup_scp_server()
+    sys.exit(0)
+
+
 def main():
     """Main function - runs continuous synchronization every minute"""
+    global _scp_server
+
+    # Register cleanup handlers
+    atexit.register(cleanup_scp_server)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(
         description='DICOM Automatic Synchronization Tool',
@@ -1380,6 +1676,48 @@ Examples:
 
     # Create query client
     client = DicomQueryClient()
+
+    # Test if local DICOM node is reachable
+    print(f"\nTesting connection to local DICOM node...")
+    print(f"  {config.local_node.ae_title}@{config.local_node.ip_address}:{config.local_node.port}")
+
+    local_reachable = client.echo_test(config.local_node)
+
+    if local_reachable:
+        print("  Status: Reachable (C-ECHO successful)")
+    else:
+        print("  Status: Not reachable")
+        print("\nLocal DICOM server is not running or not reachable.")
+        print("Starting built-in DICOM Storage SCP to receive transfers...")
+
+        # Initialize preferences manager
+        prefs_manager = PreferencesManager()
+
+        # Get OsiriX storage path
+        storage_path = prefs_manager.get_osirix_path()
+
+        # Start SCP server with local node configuration
+        _scp_server = DicomStorageSCP(
+            ae_title=config.local_node.ae_title,
+            port=config.local_node.port,
+            storage_dir=storage_path
+        )
+
+        try:
+            _scp_server.start()
+        except Exception as e:
+            print(f"\nError starting SCP server: {e}")
+            print("Cannot continue without a local DICOM server.")
+            sys.exit(1)
+
+        # Verify server is running
+        time.sleep(2)
+        if not _scp_server.running:
+            print("\nFailed to start SCP server.")
+            print("Cannot continue without a local DICOM server.")
+            sys.exit(1)
+
+        print("\nBuilt-in SCP server is now running and ready to receive DICOM files.")
 
     # Create series stability tracker (only for continuous sync mode)
     stability_tracker = None
