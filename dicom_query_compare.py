@@ -406,27 +406,41 @@ class DicomQueryClient:
         self.ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
         # Note: Transfer syntax for C-MOVE is set per-node in move_series() method
 
-    def query_studies(self, node: DicomNode, date_from: str, date_to: str) -> List[DicomStudy]:
+    def query_studies(self, node: DicomNode, date_from: str = "", date_to: str = "",
+                     patient_id: str = "") -> List[DicomStudy]:
         """
-        Query studies from a DICOM node for a date range.
+        Query studies from a DICOM node for a date range or patient ID.
 
         Args:
             node: DicomNode to query
-            date_from: Start date in YYYYMMDD format
-            date_to: End date in YYYYMMDD format
+            date_from: Start date in YYYYMMDD format (optional if patient_id provided)
+            date_to: End date in YYYYMMDD format (optional if patient_id provided)
+            patient_id: Patient ID to search for (optional)
 
         Returns:
             List of DicomStudy objects
         """
         print(f"\nQuerying {node.name} ({node.ae_title}@{node.ip_address}:{node.port})...")
-        print(f"Date range: {date_from} to {date_to}")
+
+        if patient_id:
+            print(f"Patient ID: {patient_id}")
+        else:
+            print(f"Date range: {date_from} to {date_to}")
 
         # Create the C-FIND query dataset
         ds = Dataset()
         ds.QueryRetrieveLevel = 'STUDY'
-        ds.StudyDate = f"{date_from}-{date_to}"  # Date range query
+
+        if patient_id:
+            # Query by patient ID
+            ds.PatientID = patient_id
+            ds.StudyDate = ''  # Empty to get all dates
+        else:
+            # Query by date range
+            ds.StudyDate = f"{date_from}-{date_to}"  # Date range query
+            ds.PatientID = ''
+
         ds.StudyInstanceUID = ''
-        ds.PatientID = ''
         ds.PatientName = ''
         ds.StudyDescription = ''
         ds.StudyTime = ''
@@ -1150,7 +1164,8 @@ def compare_series_and_filter(studies: List[DicomStudy], client: DicomQueryClien
 
             # CRITICAL: Skip if only 1-3 images are missing from larger series (>10 images)
             # Small series (<=10 images) with few missing images are allowed
-            if missing_images <= 3 and series.num_images > 10:
+            # BUT: Only apply this filter if NOT in all_series mode and max_images is None
+            if missing_images <= 3 and series.num_images > 10 and not all_series and max_images is None:
                 print(f"      Series {series.series_number}: {series.num_images} images ({local_image_count} local) - SKIP (only {missing_images} images missing, series > 10 images)")
                 continue
 
@@ -1430,6 +1445,154 @@ def print_study_table(studies: List[DicomStudy], title: str):
         print(f"{date_formatted:<12} {time_formatted:<10} {patient_name:<25} {desc:<35} {study.num_images:<8}")
 
 
+def get_series_for_patient(config: DicomConfig, remote_node: DicomNode,
+                          client: DicomQueryClient, patient_id: str,
+                          local_node: DicomNode,
+                          max_studies: Optional[int] = None,
+                          max_images: Optional[int] = None,
+                          all_series: bool = False) -> List[tuple]:
+    """
+    Get series for a specific patient that are missing or incomplete on local server.
+
+    Args:
+        config: DICOM configuration
+        remote_node: Remote node to query
+        client: DICOM query client
+        patient_id: Patient ID to search for
+        local_node: Local node to check for existing series
+        max_studies: Maximum number of studies to include (None = all studies, 1 = last study only)
+        max_images: If set, only return series with up to this many images
+        all_series: If True, include all series from selected studies
+
+    Returns:
+        List of (study, series, local_count) tuples
+    """
+    print(f"\n{'=' * 100}")
+    print(f"Searching for patient ID: {patient_id}")
+    print(f"{'=' * 100}")
+
+    # Query all studies for this patient
+    studies = client.query_studies(remote_node, patient_id=patient_id)
+
+    if not studies:
+        print(f"\nNo studies found for patient ID: {patient_id}")
+        return []
+
+    print(f"\nFound {len(studies)} studies for patient {patient_id}")
+
+    # Sort studies by date/time (newest first)
+    studies_with_datetime = []
+    for study in studies:
+        try:
+            study_datetime_str = f"{study.study_date}{study.study_time[:6] if len(study.study_time) >= 6 else '000000'}"
+            study_datetime = datetime.strptime(study_datetime_str, "%Y%m%d%H%M%S")
+            studies_with_datetime.append({
+                'datetime': study_datetime,
+                'study': study
+            })
+            print(f"  Study: {study.study_date} {study.study_time} - {study.study_description}")
+        except (ValueError, TypeError) as e:
+            print(f"  Warning: Could not parse date/time for study {study.study_uid}: {e}")
+            continue
+
+    if not studies_with_datetime:
+        print("\nNo valid studies found")
+        return []
+
+    # Sort by datetime (newest first)
+    studies_with_datetime.sort(key=lambda x: x['datetime'], reverse=True)
+
+    print(f"\nAfter sorting (newest first):")
+    for i, item in enumerate(studies_with_datetime, 1):
+        dt = item['datetime']
+        study = item['study']
+        print(f"  {i}. {dt.strftime('%Y-%m-%d %H:%M:%S')} - {study.study_description}")
+
+    # Select studies based on max_studies
+    if max_studies is not None:
+        selected_studies = studies_with_datetime[:max_studies]
+        print(f"\nSelecting first {max_studies} study/studies from sorted list...")
+    else:
+        selected_studies = studies_with_datetime
+
+    print(f"\n{'=' * 100}")
+    if max_studies == 1:
+        print(f"Selected ONLY the newest study:")
+    elif max_studies is not None:
+        print(f"Selected last {len(selected_studies)} studies (max: {max_studies}):")
+    else:
+        print(f"Selected all {len(selected_studies)} studies:")
+    print(f"{'=' * 100}")
+
+    # Collect all series from selected studies
+    transfer_list = []
+    total_images = 0
+
+    for study_info in selected_studies:
+        study = study_info['study']
+        dt = study_info['datetime']
+
+        print(f"\nStudy from {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  Patient: {study.patient_name}")
+        print(f"  Description: {study.study_description}")
+
+        # Query series for this study on remote
+        remote_series_list = client.query_series(remote_node, study.study_uid)
+        print(f"  Found {len(remote_series_list)} series on remote")
+
+        # Query series for this study on local
+        print(f"  Checking local server...")
+        local_series_list = client.query_series(local_node, study.study_uid)
+        local_series_dict = {series.series_uid: series.num_images for series in local_series_list}
+        print(f"  Found {len(local_series_list)} series on local")
+
+        series_count = 0
+        for series in remote_series_list:
+            local_image_count = local_series_dict.get(series.series_uid, 0)
+
+            # Skip if series is complete on local
+            if local_image_count >= series.num_images:
+                print(f"    Series {series.series_number}: {series.num_images} images - COMPLETE (skip)")
+                continue
+
+            # Skip empty series
+            if series.num_images <= 0:
+                print(f"    Series {series.series_number}: SKIP (0 images)")
+                continue
+
+            # Apply max_images filter if specified
+            if max_images is not None and series.num_images > max_images:
+                print(f"    Series {series.series_number}: SKIP ({series.num_images} > {max_images} images)")
+                continue
+
+            # Calculate missing images
+            missing_images = series.num_images - local_image_count
+
+            if local_image_count > 0:
+                status = f"INCOMPLETE ({local_image_count}/{series.num_images}, {missing_images} missing)"
+            else:
+                status = f"NEW ({series.num_images} images)"
+
+            print(f"    Series {series.series_number} ({series.modality}): {status} - {series.series_description}")
+
+            series_count += 1
+            total_images += series.num_images
+
+            # Add to transfer list with local count for potential partial transfer
+            transfer_list.append((study, series, local_image_count))
+
+        if series_count > 0:
+            print(f"  → {series_count} series selected from this study")
+        else:
+            print(f"  → All series complete on local server")
+
+    print(f"\n{'=' * 100}")
+    print(f"Total: {len(transfer_list)} series, {total_images} images from {len(selected_studies)} study/studies")
+    print(f"{'=' * 100}")
+
+    return transfer_list
+
+
 def run_sync_cycle(config: DicomConfig, remote_node: DicomNode, client: DicomQueryClient,
                    stability_tracker: Optional[SeriesStabilityTracker] = None,
                    max_images: Optional[int] = None, all_series: bool = False, hours: int = 3,
@@ -1569,6 +1732,9 @@ Examples:
   %(prog)s --node hospital1 --all-series  # Transfer all series from 'hospital1'
   %(prog)s --node ct --download-day yesterday  # Download ALL series from yesterday
   %(prog)s --node mri --download-day 20231225  # Download ALL series from specific date
+  %(prog)s --node ct --patient-id 12345  # Download last study (all series) for patient ID 12345
+  %(prog)s --node ct --patient-id 12345 --max-images 50  # Download last study, only series ≤50 images
+  %(prog)s --node ct --patient-id "12345,67890,11111"  # Download last study for multiple patients
         '''
     )
 
@@ -1593,6 +1759,13 @@ Examples:
         type=str,
         metavar='DAY',
         help='Download ALL series from a specific day (e.g., "yesterday", "today", or "20231225")'
+    )
+
+    parser.add_argument(
+        '--patient-id',
+        type=str,
+        metavar='ID',
+        help='Download series for one or more patient IDs (comma-separated, e.g., "12345,67890"). Default: last study only'
     )
 
     group = parser.add_mutually_exclusive_group()
@@ -1721,9 +1894,77 @@ Examples:
 
     # Create series stability tracker (only for continuous sync mode)
     stability_tracker = None
-    if not args.download_day:
+    if not args.download_day and not args.patient_id:
         stability_tracker = SeriesStabilityTracker()
         print(f"  Stability tracking: Enabled (prevents transferring incomplete series)")
+
+    # If patient-id is specified, download series and exit
+    if args.patient_id:
+        # Parse patient IDs (comma-separated)
+        patient_ids = [pid.strip() for pid in args.patient_id.split(',')]
+
+        print("\n" + "=" * 80)
+        if len(patient_ids) == 1:
+            print(f"Starting one-time download for patient ID: {patient_ids[0]}")
+        else:
+            print(f"Starting one-time download for {len(patient_ids)} patient IDs:")
+            for i, pid in enumerate(patient_ids, 1):
+                print(f"  {i}. {pid}")
+
+        if args.max_images:
+            print(f"Mode: Last study only, series with ≤ {args.max_images} images")
+        else:
+            print("Mode: Last study only, all series from that study")
+        print("=" * 80)
+
+        # When using --patient-id, ALWAYS download only the last study
+        # --all-series has no effect on study selection for --patient-id
+        max_studies = 1  # Always download last study only
+
+        # Determine local config to use
+        if remote_node.local_config:
+            local_ae_title = remote_node.local_config['ae_title']
+            local_ip = remote_node.local_config['ip_address']
+            local_port = remote_node.local_config['port']
+        else:
+            local_ae_title = config.local_node.ae_title
+            local_ip = config.local_node.ip_address
+            local_port = config.local_node.port
+
+        # Process each patient ID
+        total_patients_processed = 0
+        total_series_transferred = 0
+
+        for patient_id in patient_ids:
+            print(f"\n{'#' * 100}")
+            print(f"Processing patient ID: {patient_id} ({patient_ids.index(patient_id) + 1}/{len(patient_ids)})")
+            print(f"{'#' * 100}")
+
+            # Get series for this patient
+            transfer_list = get_series_for_patient(config, remote_node, client, patient_id,
+                                                  config.local_node,
+                                                  max_studies=max_studies,
+                                                  max_images=args.max_images,
+                                                  all_series=args.all_series)
+
+            if transfer_list:
+                # Transfer the series
+                transfer_series_sequential(transfer_list, client, remote_node,
+                                         local_ae_title, local_ip, local_port,
+                                         config.local_node,
+                                         stability_tracker=None,
+                                         use_image_level=args.image_level)
+                total_patients_processed += 1
+                total_series_transferred += len(transfer_list)
+            else:
+                print(f"\nNo series to transfer for patient {patient_id}")
+
+        print("\n" + "=" * 80)
+        print("Download completed")
+        print(f"  Processed: {total_patients_processed}/{len(patient_ids)} patients")
+        print(f"  Total series transferred: {total_series_transferred}")
+        print("=" * 80)
+        sys.exit(0)
 
     # If download-day is specified, run once and exit (no continuous sync)
     if args.download_day:
