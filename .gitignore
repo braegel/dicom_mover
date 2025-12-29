@@ -3,6 +3,8 @@ venv/
 env/
 ENV/
 .venv/
+bin/
+pyvenv.cfg
 
 # Python cache files
 __pycache__/
@@ -45,5 +47,16 @@ htmlcov/
 *.swo
 *~
 
-# DICOM configuration file (contains sensitive node information)
+# DICOM configuration and data files (contain sensitive information)
 dicom_config.json
+dicom_config*.json
+dicom_preferences.json
+*.json.backup
+series_stability.json
+
+# Documentation files (except README.md)
+CLAUDE.md
+FIX_*.md
+PER_*.md
+QUICK_*.md
+TRANSFER_*.md
